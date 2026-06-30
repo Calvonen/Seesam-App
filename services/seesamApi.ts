@@ -10,6 +10,11 @@ export type ChatResponse = {
   answer: string;
 };
 
+export type ServerStatusResponse = {
+  serverStatus: string;
+  details: Record<string, unknown>;
+};
+
 const extra = (Constants.expoConfig?.extra ?? {}) as ExpoExtra;
 
 function getApiBaseUrl() {
@@ -31,11 +36,103 @@ function readAnswer(payload: unknown) {
   throw new Error('Seesam API response did not include an answer.');
 }
 
+function isSensorKey(key: string) {
+  const normalizedKey = key.toLowerCase();
+
+  return normalizedKey.includes('sensor');
+}
+
+function omitSensorDetails(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(omitSensorDetails);
+  }
+
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  const details: Record<string, unknown> = {};
+
+  Object.entries(value).forEach(([key, nestedValue]) => {
+    if (!isSensorKey(key)) {
+      details[key] = omitSensorDetails(nestedValue);
+    }
+  });
+
+  return details;
+}
+
+function pickServerStatusDetails(payload: unknown) {
+  if (!payload || typeof payload !== 'object') {
+    return {};
+  }
+
+  return omitSensorDetails(payload) as Record<string, unknown>;
+}
+
+function readServerStatus(payload: unknown) {
+  if (!payload || typeof payload !== 'object') {
+    return 'Tuntematon';
+  }
+
+  const statusPayload = payload as Record<string, unknown>;
+  const serverValue =
+    statusPayload.server_status ??
+    statusPayload.serverStatus ??
+    statusPayload.status ??
+    statusPayload.state ??
+    statusPayload.health;
+
+  if (typeof serverValue === 'string') {
+    return serverValue;
+  }
+
+  if (typeof serverValue === 'boolean') {
+    return serverValue ? 'Online' : 'Offline';
+  }
+
+  if (typeof serverValue === 'number') {
+    return String(serverValue);
+  }
+
+  return 'Saatavilla';
+}
+
 async function readErrorBody(response: Response) {
   try {
     return await response.text();
   } catch {
     return '';
+  }
+}
+
+export async function getServerStatus(): Promise<ServerStatusResponse> {
+  const requestUrl = getApiBaseUrl() + '/status';
+
+  try {
+    const response = await fetch(requestUrl, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      const errorBody = await readErrorBody(response);
+      throw new Error(
+        ('Seesam status request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
+      );
+    }
+
+    const payload: unknown = await response.json();
+
+    return {
+      serverStatus: readServerStatus(payload),
+      details: pickServerStatusDetails(payload),
+    };
+  } catch (error) {
+    console.error('Seesam status error:', error);
+    throw error;
   }
 }
 

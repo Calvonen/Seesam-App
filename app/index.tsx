@@ -2,13 +2,19 @@ import { useEffect, useRef, useState } from 'react';
 import {
   Animated,
   Easing,
+  Keyboard,
+  KeyboardAvoidingView,
+  Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
+  TextInput,
+  TouchableWithoutFeedback,
   View,
 } from 'react-native';
 
-import { sendChatMessage } from '../services/seesamApi';
+import { getServerStatus, sendChatMessage, type ServerStatusResponse } from '../services/seesamApi';
 
 const SPEAKER_OPENING_SIZE = 208;
 const GRILLE_BAR_COUNT = 12;
@@ -21,8 +27,35 @@ const GRILLE_GAP =
   (GRILLE_BAR_COUNT - 1);
 const GRILLE_BARS = Array.from({ length: GRILLE_BAR_COUNT }, (_, index) => index);
 const STATIC_LINES = Array.from({ length: 18 }, (_, index) => index);
+const SERVICE_STATUS_FIELDS = [
+  { label: 'API', keys: ['api', 'serverStatus', 'server_status', 'status', 'health'] },
+  { label: 'Ollama', keys: ['ollama'] },
+  { label: 'Piper', keys: ['piper'] },
+  { label: 'SSH', keys: ['ssh'] },
+  { label: 'Fail2Ban', keys: ['fail2ban', 'fail_2_ban'] },
+  { label: 'hostname', keys: ['hostname', 'host'] },
+  { label: 'uptime', keys: ['uptime'] },
+  { label: 'CPU', keys: ['cpu', 'processor'] },
+  { label: 'RAM', keys: ['ram', 'memory', 'mem'] },
+  { label: 'disk', keys: ['disk', 'storage'] },
+  { label: 'GPU', keys: ['gpu'] },
+  { label: 'IP address', keys: ['ip_address', 'ipAddress', 'ip', 'address'] },
+];
 
 type IntercomState = 'idle' | 'listening' | 'thinking';
+
+type StatusRow = {
+  label: string;
+  value: string;
+};
+
+type MaintenanceStatusState = {
+  loading: boolean;
+  status: string | null;
+  detailRows: StatusRow[];
+  error: string | null;
+  updatedAt: string | null;
+};
 
 const STATUS_TEXT: Record<IntercomState, string> = {
   idle: 'Valmiina',
@@ -35,23 +68,57 @@ const LISTENING_DURATION = 1200;
 const CHAT_MESSAGE = 'moro Seesam';
 const ERROR_DETAIL_DISPLAY_DURATION = 6000;
 
+const EMPTY_MAINTENANCE_STATUS: MaintenanceStatusState = {
+  detailRows: [],
+  error: null,
+  loading: false,
+  status: null,
+  updatedAt: null,
+};
+
 export default function HomeScreen() {
   const [intercomState, setIntercomState] = useState<IntercomState>('idle');
   const [answerText, setAnswerText] = useState<string | null>(null);
+  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
+  const [maintenanceStatus, setMaintenanceStatus] =
+    useState<MaintenanceStatusState>(EMPTY_MAINTENANCE_STATUS);
   const [errorDetailText, setErrorDetailText] = useState<string | null>(null);
+  const [questionText, setQuestionText] = useState('');
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
   const staticOpacity = useRef(new Animated.Value(0)).current;
   const blueGlow = useRef(new Animated.Value(0)).current;
   const amberGlow = useRef(new Animated.Value(0)).current;
   const amberLoop = useRef<Animated.CompositeAnimation | null>(null);
   const flowTimers = useRef<ReturnType<typeof setTimeout>[]>([]);
   const activeRequestId = useRef(0);
+  const statusRequestId = useRef(0);
+  const scrollViewRef = useRef<ScrollView | null>(null);
   const buttonPress = useRef(new Animated.Value(0)).current;
+  const hatchProgress = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
+    const keyboardDidShow = Keyboard.addListener('keyboardDidShow', (event) => {
+      setKeyboardVisible(true);
+      setKeyboardHeight(event.endCoordinates.height);
+    });
+    const keyboardDidHide = Keyboard.addListener('keyboardDidHide', () => {
+      setKeyboardVisible(false);
+      setInputFocused(false);
+      setKeyboardHeight(0);
+      requestAnimationFrame(() => {
+        scrollViewRef.current?.scrollTo({ y: 0, animated: true });
+      });
+    });
+
     return () => {
       activeRequestId.current += 1;
+      statusRequestId.current += 1;
       amberLoop.current?.stop();
       flowTimers.current.forEach(clearTimeout);
+      keyboardDidShow.remove();
+      keyboardDidHide.remove();
     };
   }, []);
 
@@ -70,6 +137,22 @@ export default function HomeScreen() {
     outputRange: [0, 2],
   });
 
+  const frontCoverTranslateY = hatchProgress.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, 285],
+  });
+
+  const serviceConsoleOpacity = hatchProgress.interpolate({
+    inputRange: [0, 0.45, 1],
+    outputRange: [0, 0.2, 1],
+  });
+
+  const keyboardActive = keyboardVisible || inputFocused;
+  const inputAreaTranslateY =
+    Platform.OS === 'android' && keyboardVisible
+      ? -Math.min(keyboardHeight * 0.55, 190)
+      : 0;
+
 
   function clearFlowTimers() {
     flowTimers.current.forEach(clearTimeout);
@@ -77,7 +160,7 @@ export default function HomeScreen() {
   }
 
   function getChatMessage() {
-    return CHAT_MESSAGE;
+    return questionText.trim() || CHAT_MESSAGE;
   }
 
   function getErrorMessage(error: unknown) {
@@ -86,6 +169,165 @@ export default function HomeScreen() {
     }
 
     return String(error);
+  }
+
+  function normalizeStatusKey(key: string) {
+    return key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  function formatStatusValue(value: unknown) {
+    if (value === null || value === undefined || value === '') {
+      return '-';
+    }
+
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+
+  function findStatusValue(value: unknown, keys: string[]): unknown {
+    if (!value || typeof value !== 'object') {
+      return undefined;
+    }
+
+    const normalizedKeys = keys.map(normalizeStatusKey);
+
+    for (const [entryKey, entryValue] of Object.entries(value)) {
+      const normalizedEntryKey = normalizeStatusKey(entryKey);
+
+      if (normalizedEntryKey.includes('sensor')) {
+        continue;
+      }
+
+      if (normalizedKeys.includes(normalizedEntryKey)) {
+        return entryValue;
+      }
+    }
+
+    for (const [entryKey, entryValue] of Object.entries(value)) {
+      if (normalizeStatusKey(entryKey).includes('sensor')) {
+        continue;
+      }
+
+      const nestedValue = findStatusValue(entryValue, keys);
+
+      if (nestedValue !== undefined) {
+        return nestedValue;
+      }
+    }
+
+    return undefined;
+  }
+
+  function getServiceLedStyle(value: string) {
+    const normalizedValue = value.toLowerCase();
+
+    if (
+      value === '-' ||
+      normalizedValue.includes('offline') ||
+      normalizedValue.includes('down') ||
+      normalizedValue.includes('error') ||
+      normalizedValue.includes('fail') ||
+      normalizedValue.includes('stopped')
+    ) {
+      return styles.serviceLedAmber;
+    }
+
+    return styles.serviceLedGreen;
+  }
+
+  function getServerStatusRows(status: ServerStatusResponse) {
+    return SERVICE_STATUS_FIELDS.map((field) => {
+      const value =
+        field.label === 'API'
+          ? findStatusValue(status.details, field.keys) ?? status.serverStatus
+          : findStatusValue(status.details, field.keys);
+
+      return {
+        label: field.label,
+        value: formatStatusValue(value),
+      };
+    }).filter((row) => row.label !== 'GPU' || row.value !== '-');
+  }
+
+  async function refreshMaintenanceStatus() {
+    const requestId = statusRequestId.current + 1;
+    statusRequestId.current = requestId;
+
+    setMaintenanceStatus((currentStatus) => ({
+      ...currentStatus,
+      error: null,
+      loading: true,
+    }));
+
+    try {
+      const serverStatus = await getServerStatus();
+
+      if (statusRequestId.current !== requestId) {
+        return;
+      }
+
+      setMaintenanceStatus({
+        detailRows: getServerStatusRows(serverStatus),
+        error: null,
+        loading: false,
+        status: serverStatus.serverStatus,
+        updatedAt: new Date().toLocaleTimeString('fi-FI', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      });
+    } catch (error) {
+      if (statusRequestId.current !== requestId) {
+        return;
+      }
+
+      setMaintenanceStatus({
+        detailRows: [],
+        error: getErrorMessage(error),
+        loading: false,
+        status: null,
+        updatedAt: null,
+      });
+    }
+  }
+
+  function openMaintenanceMode() {
+    setMaintenanceOpen(true);
+    void refreshMaintenanceStatus();
+    Animated.timing(hatchProgress, {
+      toValue: 1,
+      duration: 950,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+  }
+
+  function closeMaintenanceMode() {
+    statusRequestId.current += 1;
+    Animated.timing(hatchProgress, {
+      toValue: 0,
+      duration: 850,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start(() => {
+      setMaintenanceOpen(false);
+    });
+  }
+
+  function toggleMaintenanceMode() {
+    if (maintenanceOpen) {
+      closeMaintenanceMode();
+      return;
+    }
+
+    openMaintenanceMode();
   }
 
   function finishWithAnswer(answer: string) {
@@ -286,74 +528,179 @@ export default function HomeScreen() {
   }
 
   return (
-    <View style={styles.screen}>
-      <View style={styles.device}>
+    <TouchableWithoutFeedback accessible={false} onPress={Keyboard.dismiss}>
+      <View style={styles.screen}>
+        <KeyboardAvoidingView
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      style={styles.screen}
+    >
+      <ScrollView
+        contentContainerStyle={[
+          styles.screenScroll,
+          Platform.OS === 'ios' && keyboardActive && styles.screenScrollKeyboard,
+        ]}
+        ref={scrollViewRef}
+        style={styles.screenScroller}
+        endFillColor="#17120f"
+        keyboardShouldPersistTaps="handled"
+        overScrollMode="never"
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.device}>
         <Text style={styles.title}>SEESAM</Text>
 
-        <View style={styles.speakerWrap}>
-          <Animated.View
-            style={[
-              styles.ledRing,
-              styles.blueLedRing,
-              {
-                opacity: blueGlow,
-                transform: [{ scale: blueScale }],
-              },
-            ]}
-          />
-          <Animated.View
-            style={[
-              styles.ledRing,
-              styles.amberLedRing,
-              {
-                opacity: amberGlow,
-                transform: [{ scale: amberScale }],
-              },
-            ]}
-          />
-          <View style={styles.speakerHousing}>
-            <View style={styles.fabric}>
-              {GRILLE_BARS.map((bar) => (
-                <View
-                  key={bar}
-                  style={[
-                    styles.grilleBar,
-                    {
-                      left: GRILLE_EDGE_INSET + bar * (GRILLE_BAR_WIDTH + GRILLE_GAP),
-                    },
-                  ]}
-                />
-              ))}
-            </View>
+        <Animated.View
+          pointerEvents={maintenanceOpen ? "auto" : "none"}
+          style={[
+            styles.serviceConsole,
+            { opacity: serviceConsoleOpacity },
+          ]}
+        >
+          <Text style={styles.serviceTitle}>SERVICE CONSOLE</Text>
+          <ScrollView
+            contentContainerStyle={styles.serviceScrollContent}
+            nestedScrollEnabled
+            showsVerticalScrollIndicator={false}
+            style={styles.serviceScroll}
+          >
+            {maintenanceStatus.error ? (
+              <View style={styles.serviceLine}>
+                <View style={[styles.serviceLed, styles.serviceLedAmber]} />
+                <View style={styles.serviceTextGroup}>
+                  <Text style={styles.serviceLabel}>STATUS</Text>
+                  <Text style={styles.serviceValue}>{maintenanceStatus.error}</Text>
+                </View>
+              </View>
+            ) : null}
+
+            {maintenanceStatus.loading ? (
+              <View style={styles.serviceLine}>
+                <View style={[styles.serviceLed, styles.serviceLedAmber]} />
+                <View style={styles.serviceTextGroup}>
+                  <Text style={styles.serviceLabel}>STATUS</Text>
+                  <Text style={styles.serviceValue}>SYNCING...</Text>
+                </View>
+              </View>
+            ) : (
+              maintenanceStatus.detailRows.map((row) => (
+                <View key={row.label} style={styles.serviceLine}>
+                  <View
+                    style={[
+                      styles.serviceLed,
+                      getServiceLedStyle(row.value),
+                    ]}
+                  />
+                  <View style={styles.serviceTextGroup}>
+                    <Text style={styles.serviceLabel}>{row.label}</Text>
+                    <Text style={styles.serviceValue}>{row.value}</Text>
+                  </View>
+                </View>
+              ))
+            )}
+          </ScrollView>
+        </Animated.View>
+
+        <Animated.View
+          style={[
+            styles.frontCover,
+            { transform: [{ translateY: frontCoverTranslateY }] },
+          ]}
+        >
+          <View style={styles.speakerWrap}>
+            <Animated.View
+              style={[
+                styles.ledRing,
+                styles.blueLedRing,
+                {
+                  opacity: blueGlow,
+                  transform: [{ scale: blueScale }],
+                },
+              ]}
+            />
+            <Animated.View
+              style={[
+                styles.ledRing,
+                styles.amberLedRing,
+                {
+                  opacity: amberGlow,
+                  transform: [{ scale: amberScale }],
+                },
+              ]}
+            />
+            <Pressable
+              accessibilityLabel={maintenanceOpen ? "Close maintenance mode" : "Open maintenance mode"}
+              delayLongPress={700}
+              onLongPress={toggleMaintenanceMode}
+              style={styles.speakerPressable}
+            >
+              <View style={styles.speakerHousing}>
+                <View style={styles.fabric}>
+                  <View style={styles.hatchGrille}>
+                    {GRILLE_BARS.map((bar) => (
+                      <View
+                        key={bar}
+                        style={[
+                          styles.grilleBar,
+                          {
+                            left: GRILLE_EDGE_INSET + bar * (GRILLE_BAR_WIDTH + GRILLE_GAP),
+                          },
+                        ]}
+                      />
+                    ))}
+                  </View>
+                </View>
+              </View>
+            </Pressable>
           </View>
-        </View>
 
-        <Text style={styles.status}>{STATUS_TEXT[intercomState]}</Text>
-        <Text style={styles.answer}>{answerText ?? ' '}</Text>
-        {errorDetailText ? (
-          <Text style={styles.errorDetail}>{errorDetailText}</Text>
-        ) : null}
+          <Text style={styles.status}>{STATUS_TEXT[intercomState]}</Text>
+          <Text style={styles.answer}>{answerText ?? " "}</Text>
+          {errorDetailText ? (
+            <Text style={styles.errorDetail}>{errorDetailText}</Text>
+          ) : null}
 
-        <Animated.View style={{ transform: [{ translateY: buttonTranslateY }] }}>
-          <Pressable
-            accessibilityLabel="Push to listen"
-            onPress={startIntercomFlow}
-            onPressIn={pressButton}
-            onPressOut={releaseButton}
-            style={({ pressed }) => [
-              styles.buttonWell,
-              pressed && styles.buttonWellPressed,
+          <View
+            style={[
+              styles.inputArea,
+              { transform: [{ translateY: inputAreaTranslateY }] },
             ]}
           >
-            <View style={styles.pushButton}>
-              <View style={styles.brushedBandTop} />
-              <View style={styles.brushedBandMiddle} />
-              <View style={styles.brushedBandBottom} />
-              <View style={styles.metalSheen} />
-            </View>
-          </Pressable>
+            <TextInput
+            accessibilityLabel="Seesam question"
+            autoCapitalize="sentences"
+            onBlur={() => setInputFocused(false)}
+            onChangeText={setQuestionText}
+            onFocus={() => setInputFocused(true)}
+            placeholder="Kysy Seesamilta..."
+            placeholderTextColor="#765233"
+            returnKeyType="done"
+            style={styles.questionInput}
+            value={questionText}
+          />
+          </View>
+
+          <Animated.View style={{ transform: [{ translateY: buttonTranslateY }] }}>
+            <Pressable
+              accessibilityLabel="Push to listen"
+              onPress={startIntercomFlow}
+              onPressIn={pressButton}
+              onPressOut={releaseButton}
+              style={({ pressed }) => [
+                styles.buttonWell,
+                pressed && styles.buttonWellPressed,
+              ]}
+            >
+              <View style={styles.pushButton}>
+                <View style={styles.brushedBandTop} />
+                <View style={styles.brushedBandMiddle} />
+                <View style={styles.brushedBandBottom} />
+                <View style={styles.metalSheen} />
+              </View>
+            </Pressable>
+          </Animated.View>
         </Animated.View>
-      </View>
+        </View>
+      </ScrollView>
 
       <Animated.View
         pointerEvents="none"
@@ -373,17 +720,32 @@ export default function HomeScreen() {
           />
         ))}
       </Animated.View>
-    </View>
+        </KeyboardAvoidingView>
+      </View>
+    </TouchableWithoutFeedback>
   );
 }
 
 const styles = StyleSheet.create({
   screen: {
-    alignItems: 'center',
     backgroundColor: '#17120f',
     flex: 1,
+  },
+  screenScroller: {
+    backgroundColor: '#17120f',
+    flex: 1,
+  },
+  screenScroll: {
+    alignItems: 'center',
+    backgroundColor: '#17120f',
+    flexGrow: 1,
     justifyContent: 'center',
     padding: 22,
+    paddingBottom: 22,
+  },
+  screenScrollKeyboard: {
+    justifyContent: 'flex-start',
+    paddingBottom: 48,
   },
   device: {
     alignItems: 'center',
@@ -402,6 +764,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.34,
     shadowRadius: 16,
     width: '100%',
+    position: 'relative',
   },
   title: {
     color: '#3f2b1d',
@@ -415,6 +778,12 @@ const styles = StyleSheet.create({
     height: 292,
     justifyContent: 'center',
     marginBottom: 28,
+    width: 292,
+  },
+  speakerPressable: {
+    alignItems: 'center',
+    height: 292,
+    justifyContent: 'center',
     width: 292,
   },
   ledRing: {
@@ -464,6 +833,99 @@ const styles = StyleSheet.create({
     position: 'relative',
     width: SPEAKER_OPENING_SIZE,
   },
+  hatchGrille: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#11100f',
+    borderRadius: 98,
+    overflow: 'hidden',
+  },
+  frontCover: {
+    alignItems: 'center',
+    backgroundColor: '#d7b98c',
+    position: 'relative',
+    width: '100%',
+    zIndex: 3,
+  },
+  serviceConsole: {
+    backgroundColor: '#080b09',
+    borderColor: '#17251b',
+    borderRadius: 8,
+    borderWidth: 3,
+    bottom: 116,
+    left: 18,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 14,
+    position: 'absolute',
+    right: 18,
+    shadowColor: '#000000',
+    shadowOffset: { height: 5, width: 0 },
+    shadowOpacity: 0.45,
+    shadowRadius: 8,
+    top: 116,
+    zIndex: 1,
+  },
+  serviceTitle: {
+    color: '#8df58c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0,
+    marginBottom: 6,
+    paddingRight: 22,
+  },
+  serviceScroll: {
+    flex: 1,
+  },
+  serviceScrollContent: {
+    paddingBottom: 12,
+  },
+  serviceLine: {
+    alignItems: 'flex-start',
+    borderTopColor: 'rgba(141, 245, 140, 0.12)',
+    borderTopWidth: 1,
+    flexDirection: 'row',
+    paddingVertical: 4,
+  },
+  serviceLed: {
+    borderRadius: 4,
+    height: 8,
+    marginRight: 7,
+    marginTop: 4,
+    width: 8,
+  },
+  serviceLedGreen: {
+    backgroundColor: '#4cff78',
+    shadowColor: '#4cff78',
+    shadowOffset: { height: 0, width: 0 },
+    shadowOpacity: 0.65,
+    shadowRadius: 4,
+  },
+  serviceLedAmber: {
+    backgroundColor: '#f0aa3c',
+    shadowColor: '#f0aa3c',
+    shadowOffset: { height: 0, width: 0 },
+    shadowOpacity: 0.55,
+    shadowRadius: 4,
+  },
+  serviceTextGroup: {
+    flex: 1,
+  },
+  serviceLabel: {
+    color: '#f0aa3c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0,
+    textTransform: 'uppercase',
+  },
+  serviceValue: {
+    color: '#8df58c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0,
+  },
   grilleBar: {
     backgroundColor: '#ad8758',
     borderLeftColor: '#caa676',
@@ -479,6 +941,10 @@ const styles = StyleSheet.create({
     shadowRadius: 1,
     top: 0,
     width: GRILLE_BAR_WIDTH,
+  },
+  inputArea: {
+    alignItems: 'center',
+    width: '100%',
   },
   status: {
     color: '#3f2b1d',
@@ -504,6 +970,21 @@ const styles = StyleSheet.create({
     marginTop: 4,
     maxWidth: 300,
     textAlign: 'center',
+  },
+  questionInput: {
+    backgroundColor: 'rgba(255, 255, 248, 0.22)',
+    borderColor: '#7c5b37',
+    borderRadius: 8,
+    borderWidth: 2,
+    color: '#3f2b1d',
+    fontSize: 15,
+    fontWeight: '600',
+    height: 40,
+    letterSpacing: 0,
+    marginBottom: 16,
+    marginTop: 10,
+    paddingHorizontal: 12,
+    width: '100%',
   },
   buttonWell: {
     alignItems: 'center',
