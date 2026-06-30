@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Seesam",
+    "slug": "seesam-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "seesam",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "android": {
+      "package": "com.seesam.app"
+    },
+    "plugins": [
+      "expo-router"
+    ],
+    "extra": {
+      "seesamApiBaseUrl": "http://83.146.233.178:8000"
+    },
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
