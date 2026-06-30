@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import { Audio } from 'expo-av';
+import * as FileSystem from 'expo-file-system/legacy';
 import {
   Animated,
   Easing,
@@ -14,7 +16,12 @@ import {
   View,
 } from 'react-native';
 
-import { getServerStatus, sendChatMessage, type ServerStatusResponse } from '../services/seesamApi';
+import {
+  getServerStatus,
+  getSpeechAudio,
+  sendChatMessage,
+  type ServerStatusResponse,
+} from '../services/seesamApi';
 
 const SPEAKER_OPENING_SIZE = 208;
 const GRILLE_BAR_COUNT = 12;
@@ -67,6 +74,7 @@ const CRACKLE_DURATION = 280;
 const LISTENING_DURATION = 1200;
 const CHAT_MESSAGE = 'moro Seesam';
 const ERROR_DETAIL_DISPLAY_DURATION = 6000;
+const SPEECH_ERROR_DISPLAY_DURATION = 5000;
 
 const EMPTY_MAINTENANCE_STATUS: MaintenanceStatusState = {
   detailRows: [],
@@ -97,8 +105,19 @@ export default function HomeScreen() {
   const scrollViewRef = useRef<ScrollView | null>(null);
   const buttonPress = useRef(new Animated.Value(0)).current;
   const hatchProgress = useRef(new Animated.Value(0)).current;
+  const speechGlow = useRef(new Animated.Value(0)).current;
+  const speechGlowLoop = useRef<Animated.CompositeAnimation | null>(null);
+  const speechSound = useRef<Audio.Sound | null>(null);
 
   useEffect(() => {
+    void Audio.setAudioModeAsync({
+      allowsRecordingIOS: false,
+      playsInSilentModeIOS: true,
+      shouldDuckAndroid: true,
+      staysActiveInBackground: false,
+      playThroughEarpieceAndroid: false,
+    });
+
     const keyboardDidShow = Keyboard.addListener('keyboardDidShow', (event) => {
       setKeyboardVisible(true);
       setKeyboardHeight(event.endCoordinates.height);
@@ -116,6 +135,8 @@ export default function HomeScreen() {
       activeRequestId.current += 1;
       statusRequestId.current += 1;
       amberLoop.current?.stop();
+      speechGlowLoop.current?.stop();
+      void speechSound.current?.unloadAsync();
       flowTimers.current.forEach(clearTimeout);
       keyboardDidShow.remove();
       keyboardDidHide.remove();
@@ -147,6 +168,11 @@ export default function HomeScreen() {
     outputRange: [0, 0.2, 1],
   });
 
+  const speechGlowScale = speechGlow.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.99, 1.035],
+  });
+
   const keyboardActive = keyboardVisible || inputFocused;
   const inputAreaTranslateY =
     Platform.OS === 'android' && keyboardVisible
@@ -169,6 +195,135 @@ export default function HomeScreen() {
     }
 
     return String(error);
+  }
+
+  function arrayBufferToBase64(buffer: ArrayBuffer) {
+    const bytes = new Uint8Array(buffer);
+    const base64Characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let base64 = "";
+
+    for (let index = 0; index < bytes.length; index += 3) {
+      const firstByte = bytes[index];
+      const secondByte = bytes[index + 1];
+      const thirdByte = bytes[index + 2];
+      const hasSecondByte = index + 1 < bytes.length;
+      const hasThirdByte = index + 2 < bytes.length;
+      const triplet =
+        (firstByte << 16) |
+        ((hasSecondByte ? secondByte : 0) << 8) |
+        (hasThirdByte ? thirdByte : 0);
+
+      base64 += base64Characters[(triplet >> 18) & 63];
+      base64 += base64Characters[(triplet >> 12) & 63];
+      base64 += hasSecondByte ? base64Characters[(triplet >> 6) & 63] : "=";
+      base64 += hasThirdByte ? base64Characters[triplet & 63] : "=";
+    }
+
+    return base64;
+  }
+
+  async function unloadSpeechSound() {
+    const currentSound = speechSound.current;
+
+    if (!currentSound) {
+      return;
+    }
+
+    speechSound.current = null;
+    await currentSound.unloadAsync();
+  }
+
+  function startSpeechGlow() {
+    speechGlowLoop.current?.stop();
+    speechGlow.stopAnimation();
+    speechGlow.setValue(0);
+
+    speechGlowLoop.current = Animated.loop(
+      Animated.sequence([
+        Animated.timing(speechGlow, {
+          toValue: 1,
+          duration: 820,
+          easing: Easing.inOut(Easing.sin),
+          useNativeDriver: true,
+        }),
+        Animated.timing(speechGlow, {
+          toValue: 0.18,
+          duration: 820,
+          easing: Easing.inOut(Easing.sin),
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    speechGlowLoop.current.start();
+  }
+
+  function stopSpeechGlow() {
+    speechGlowLoop.current?.stop();
+    speechGlowLoop.current = null;
+    Animated.timing(speechGlow, {
+      toValue: 0,
+      duration: 260,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: true,
+    }).start();
+  }
+
+  function showSpeechPlaybackError() {
+    setErrorDetailText("Äänen toisto epäonnistui.");
+
+    flowTimers.current.push(
+      setTimeout(() => {
+        setErrorDetailText(null);
+      }, SPEECH_ERROR_DISPLAY_DURATION),
+    );
+  }
+
+  async function playAnswerAudio(answer: string, requestId: number) {
+    try {
+      await unloadSpeechSound();
+      const speechAudio = await getSpeechAudio(answer);
+
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      const audioUri = FileSystem.cacheDirectory + "seesam-answer-" + requestId + ".wav";
+      await FileSystem.writeAsStringAsync(audioUri, arrayBufferToBase64(speechAudio.audio), {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: audioUri },
+        { shouldPlay: true },
+      );
+      speechSound.current = sound;
+      startSpeechGlow();
+
+      sound.setOnPlaybackStatusUpdate((playbackStatus) => {
+        if (!playbackStatus.isLoaded) {
+          return;
+        }
+
+        if (playbackStatus.didJustFinish) {
+          stopSpeechGlow();
+          void unloadSpeechSound();
+        }
+      });
+    } catch (error) {
+      console.error("Seesam speech playback failed:", error);
+
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      stopSpeechGlow();
+      void unloadSpeechSound();
+      showSpeechPlaybackError();
+    }
   }
 
   function normalizeStatusKey(key: string) {
@@ -357,6 +512,7 @@ export default function HomeScreen() {
       }
 
       finishWithAnswer(response.answer);
+      void playAnswerAudio(response.answer, requestId);
     } catch (error) {
       console.error('Seesam chat request failed:', error);
 
@@ -493,6 +649,8 @@ export default function HomeScreen() {
     const chatMessage = getChatMessage();
 
     amberLoop.current?.stop();
+    stopSpeechGlow();
+    void unloadSpeechSound();
     setAnswerText(null);
     setErrorDetailText(null);
     setIntercomState('idle');
@@ -624,6 +782,16 @@ export default function HomeScreen() {
                 {
                   opacity: amberGlow,
                   transform: [{ scale: amberScale }],
+                },
+              ]}
+            />
+            <Animated.View
+              style={[
+                styles.ledRing,
+                styles.speechLedRing,
+                {
+                  opacity: speechGlow,
+                  transform: [{ scale: speechGlowScale }],
                 },
               ]}
             />
@@ -805,6 +973,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#d46f2b',
     borderColor: '#ffc06f',
     shadowColor: '#f0a245',
+  },
+  speechLedRing: {
+    backgroundColor: '#3f8f75',
+    borderColor: '#9bd7c4',
+    shadowColor: '#69d8b3',
   },
   speakerHousing: {
     alignItems: 'center',

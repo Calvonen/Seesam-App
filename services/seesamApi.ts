@@ -15,6 +15,10 @@ export type ServerStatusResponse = {
   details: Record<string, unknown>;
 };
 
+export type SpeechAudioResponse = {
+  audio: ArrayBuffer;
+};
+
 const extra = (Constants.expoConfig?.extra ?? {}) as ExpoExtra;
 
 function getApiBaseUrl() {
@@ -132,6 +136,35 @@ export async function getServerStatus(): Promise<ServerStatusResponse> {
     };
   } catch (error) {
     console.error('Seesam status error:', error);
+    throw error;
+  }
+}
+
+export async function getSpeechAudio(text: string): Promise<SpeechAudioResponse> {
+  const requestUrl = getApiBaseUrl() + "/speak";
+
+  try {
+    const response = await fetch(requestUrl, {
+      method: "POST",
+      headers: {
+        Accept: "audio/wav",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await readErrorBody(response);
+      throw new Error(
+        ("Seesam speak request failed with " + response.status + " " + response.statusText + ". " + errorBody).trim(),
+      );
+    }
+
+    return {
+      audio: await response.arrayBuffer(),
+    };
+  } catch (error) {
+    console.error("Seesam /speak request failed:", requestUrl, error);
     throw error;
   }
 }
