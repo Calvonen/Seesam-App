@@ -20,6 +20,8 @@ import {
   getServerStatus,
   getSpeechAudio,
   sendChatMessage,
+  transcribeAudio,
+  SeesamRequestError,
   type ServerStatusResponse,
 } from '../services/seesamApi';
 
@@ -40,13 +42,10 @@ const SERVICE_STATUS_FIELDS = [
   { label: 'Piper', keys: ['piper'] },
   { label: 'SSH', keys: ['ssh'] },
   { label: 'Fail2Ban', keys: ['fail2ban', 'fail_2_ban'] },
-  { label: 'hostname', keys: ['hostname', 'host'] },
-  { label: 'uptime', keys: ['uptime'] },
   { label: 'CPU', keys: ['cpu', 'processor'] },
   { label: 'RAM', keys: ['ram', 'memory', 'mem'] },
-  { label: 'disk', keys: ['disk', 'storage'] },
-  { label: 'GPU', keys: ['gpu'] },
-  { label: 'IP address', keys: ['ip_address', 'ipAddress', 'ip', 'address'] },
+  { label: 'Disk', keys: ['disk', 'storage'] },
+  { label: 'IP', keys: ['ip_address', 'ipAddress', 'ip', 'address'] },
 ];
 
 type IntercomState = 'idle' | 'listening' | 'thinking';
@@ -64,17 +63,30 @@ type MaintenanceStatusState = {
   updatedAt: string | null;
 };
 
+type PushToTalkStep = 'recording' | 'transcribe' | 'chat' | 'speak' | 'playback';
+
 const STATUS_TEXT: Record<IntercomState, string> = {
   idle: 'Valmiina',
   listening: 'Kuuntelen...',
-  thinking: 'Mietin...',
+  thinking: 'Ajattelen...',
 };
 
-const CRACKLE_DURATION = 280;
-const LISTENING_DURATION = 1200;
-const CHAT_MESSAGE = 'moro Seesam';
-const ERROR_DETAIL_DISPLAY_DURATION = 6000;
-const SPEECH_ERROR_DISPLAY_DURATION = 5000;
+const MIN_RECORDING_DURATION_MS = 300;
+const RECORDING_FILE_READY_DELAY_MS = 250;
+const TRANSCRIBE_RETRY_DELAY_MS = 500;
+const STEP_ERROR_TEXT: Record<PushToTalkStep, string> = {
+  recording: 'Äänitys epäonnistui.',
+  transcribe: 'Puheen tunnistus epäonnistui.',
+  chat: 'Seesam-yhteys epäonnistui.',
+  speak: 'Puheen muodostus epäonnistui.',
+  playback: 'Äänen toisto epäonnistui.',
+};
+
+function devLog(...messages: unknown[]) {
+  if (__DEV__) {
+    console.log(...messages);
+  }
+}
 
 const EMPTY_MAINTENANCE_STATUS: MaintenanceStatusState = {
   detailRows: [],
@@ -87,11 +99,12 @@ const EMPTY_MAINTENANCE_STATUS: MaintenanceStatusState = {
 export default function HomeScreen() {
   const [intercomState, setIntercomState] = useState<IntercomState>('idle');
   const [answerText, setAnswerText] = useState<string | null>(null);
-  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
+  const [maintenanceMode, setMaintenanceMode] = useState(false);
   const [maintenanceStatus, setMaintenanceStatus] =
     useState<MaintenanceStatusState>(EMPTY_MAINTENANCE_STATUS);
   const [errorDetailText, setErrorDetailText] = useState<string | null>(null);
   const [questionText, setQuestionText] = useState('');
+  const [textMode, setTextMode] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
@@ -108,6 +121,12 @@ export default function HomeScreen() {
   const speechGlow = useRef(new Animated.Value(0)).current;
   const speechGlowLoop = useRef<Animated.CompositeAnimation | null>(null);
   const speechSound = useRef<Audio.Sound | null>(null);
+  const recording = useRef<Audio.Recording | null>(null);
+  const recordingRequestId = useRef<number | null>(null);
+  const recordingStartInProgress = useRef(false);
+  const recordingStartedAt = useRef<number | null>(null);
+  const recordingStopInProgress = useRef(false);
+  const stopRecordingAfterStart = useRef(false);
 
   useEffect(() => {
     void Audio.setAudioModeAsync({
@@ -137,6 +156,7 @@ export default function HomeScreen() {
       amberLoop.current?.stop();
       speechGlowLoop.current?.stop();
       void speechSound.current?.unloadAsync();
+      void recording.current?.stopAndUnloadAsync();
       flowTimers.current.forEach(clearTimeout);
       keyboardDidShow.remove();
       keyboardDidHide.remove();
@@ -178,15 +198,12 @@ export default function HomeScreen() {
     Platform.OS === 'android' && keyboardVisible
       ? -Math.min(keyboardHeight * 0.55, 190)
       : 0;
+  const terminalOutput = errorDetailText ?? answerText ?? 'TEXT LINK READY';
 
 
   function clearFlowTimers() {
     flowTimers.current.forEach(clearTimeout);
     flowTimers.current = [];
-  }
-
-  function getChatMessage() {
-    return questionText.trim() || CHAT_MESSAGE;
   }
 
   function getErrorMessage(error: unknown) {
@@ -195,6 +212,48 @@ export default function HomeScreen() {
     }
 
     return String(error);
+  }
+
+  function delay(ms: number) {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  function isNetworkRequestFailed(error: unknown): boolean {
+    const candidateError = error instanceof SeesamRequestError ? error.originalError : error;
+
+    return getErrorMessage(candidateError) === 'Network request failed';
+  }
+
+  async function getRecordingFileReadiness(audioUri: string) {
+    const fileInfo = await FileSystem.getInfoAsync(audioUri);
+    const fileSize = fileInfo.exists ? fileInfo.size ?? 0 : 0;
+
+    return {
+      exists: fileInfo.exists,
+      size: fileSize,
+    };
+  }
+
+  async function waitForRecordingFileReady(audioUri: string) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await delay(RECORDING_FILE_READY_DELAY_MS);
+
+      const fileReadiness = await getRecordingFileReadiness(audioUri);
+
+      devLog('Seesam recording file', {
+        exists: fileReadiness.exists,
+        size: fileReadiness.size,
+        uri: audioUri,
+      });
+
+      if (fileReadiness.exists && fileReadiness.size > 0) {
+        return;
+      }
+    }
+
+    throw new Error('Tallennettu äänitiedosto ei ole valmis.');
   }
 
   function arrayBufferToBase64(buffer: ArrayBuffer) {
@@ -268,25 +327,46 @@ export default function HomeScreen() {
     }).start();
   }
 
-  function showSpeechPlaybackError() {
-    setErrorDetailText("Äänen toisto epäonnistui.");
-
-    flowTimers.current.push(
-      setTimeout(() => {
-        setErrorDetailText(null);
-      }, SPEECH_ERROR_DISPLAY_DURATION),
-    );
+  async function restorePlaybackAudioMode() {
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: false,
+      playsInSilentModeIOS: true,
+      shouldDuckAndroid: true,
+      staysActiveInBackground: false,
+      playThroughEarpieceAndroid: false,
+    });
   }
 
   async function playAnswerAudio(answer: string, requestId: number) {
     try {
       await unloadSpeechSound();
-      const speechAudio = await getSpeechAudio(answer);
-
+    } catch (error) {
       if (activeRequestId.current !== requestId) {
         return;
       }
 
+      showStepFailure('playback', error, 'local-playback');
+      return;
+    }
+
+    let speechAudio;
+
+    try {
+      speechAudio = await getSpeechAudio(answer);
+    } catch (error) {
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      showStepFailure('speak', error);
+      return;
+    }
+
+    if (activeRequestId.current !== requestId) {
+      return;
+    }
+
+    try {
       const audioUri = FileSystem.cacheDirectory + "seesam-answer-" + requestId + ".wav";
       await FileSystem.writeAsStringAsync(audioUri, arrayBufferToBase64(speechAudio.audio), {
         encoding: FileSystem.EncodingType.Base64,
@@ -309,20 +389,23 @@ export default function HomeScreen() {
         }
 
         if (playbackStatus.didJustFinish) {
+          if (activeRequestId.current !== requestId) {
+            return;
+          }
+
           stopSpeechGlow();
           void unloadSpeechSound();
+          returnToIdle();
         }
       });
     } catch (error) {
-      console.error("Seesam speech playback failed:", error);
-
       if (activeRequestId.current !== requestId) {
         return;
       }
 
       stopSpeechGlow();
       void unloadSpeechSound();
-      showSpeechPlaybackError();
+      showStepFailure('playback', error, 'local-playback');
     }
   }
 
@@ -408,7 +491,7 @@ export default function HomeScreen() {
         label: field.label,
         value: formatStatusValue(value),
       };
-    }).filter((row) => row.label !== 'GPU' || row.value !== '-');
+    });
   }
 
   async function refreshMaintenanceStatus() {
@@ -454,7 +537,7 @@ export default function HomeScreen() {
   }
 
   function openMaintenanceMode() {
-    setMaintenanceOpen(true);
+    setMaintenanceMode(true);
     void refreshMaintenanceStatus();
     Animated.timing(hatchProgress, {
       toValue: 1,
@@ -472,12 +555,12 @@ export default function HomeScreen() {
       easing: Easing.out(Easing.cubic),
       useNativeDriver: true,
     }).start(() => {
-      setMaintenanceOpen(false);
+      setMaintenanceMode(false);
     });
   }
 
   function toggleMaintenanceMode() {
-    if (maintenanceOpen) {
+    if (maintenanceMode) {
       closeMaintenanceMode();
       return;
     }
@@ -485,22 +568,63 @@ export default function HomeScreen() {
     openMaintenanceMode();
   }
 
-  function finishWithAnswer(answer: string) {
-    setAnswerText(answer);
-    setErrorDetailText(null);
-    returnToIdle();
+  function toggleTextMode() {
+    setTextMode((enabled) => {
+      const nextEnabled = !enabled;
+
+      if (!nextEnabled) {
+        Keyboard.dismiss();
+        setInputFocused(false);
+      }
+
+      return nextEnabled;
+    });
   }
 
-  function finishWithError(error: unknown) {
-    setAnswerText('Yhteys Seesamiin epäonnistui.');
-    setErrorDetailText(getErrorMessage(error));
-    returnToIdle();
+  function showAnswer(answer: string) {
+    setAnswerText(answer);
+    setErrorDetailText(null);
+  }
 
-    flowTimers.current.push(
-      setTimeout(() => {
-        setErrorDetailText(null);
-      }, ERROR_DETAIL_DISPLAY_DURATION),
-    );
+  function getStepFailureDetails(
+    step: PushToTalkStep,
+    error: unknown,
+    fallbackRequestUrl = 'local',
+  ): { originalError: unknown; requestUrl: string; step: PushToTalkStep } {
+    if (error instanceof SeesamRequestError && error.step !== 'status') {
+      return {
+        originalError: error.originalError,
+        requestUrl: error.requestUrl,
+        step: error.step,
+      };
+    }
+
+    if (error instanceof SeesamRequestError) {
+      return {
+        originalError: error.originalError,
+        requestUrl: error.requestUrl,
+        step,
+      };
+    }
+
+    return {
+      originalError: error,
+      requestUrl: fallbackRequestUrl,
+      step,
+    };
+  }
+
+  function showStepFailure(step: PushToTalkStep, error: unknown, fallbackRequestUrl = 'local') {
+    const failureDetails = getStepFailureDetails(step, error, fallbackRequestUrl);
+
+    console.warn('Seesam step failed', {
+      originalError: failureDetails.originalError,
+      requestUrl: failureDetails.requestUrl,
+      step: failureDetails.step,
+    });
+    setAnswerText(STEP_ERROR_TEXT[failureDetails.step]);
+    setErrorDetailText(null);
+    returnToIdle();
   }
 
   async function askSeesam(message: string, requestId: number) {
@@ -511,16 +635,20 @@ export default function HomeScreen() {
         return;
       }
 
-      finishWithAnswer(response.answer);
-      void playAnswerAudio(response.answer, requestId);
-    } catch (error) {
-      console.error('Seesam chat request failed:', error);
+      showAnswer(response.answer);
 
+      if (!textMode) {
+        void playAnswerAudio(response.answer, requestId);
+        return;
+      }
+
+      returnToIdle();
+    } catch (error) {
       if (activeRequestId.current !== requestId) {
         return;
       }
 
-      finishWithError(error);
+      showStepFailure('chat', error);
     }
   }
 
@@ -542,37 +670,6 @@ export default function HomeScreen() {
       tension: 180,
       useNativeDriver: true,
     }).start();
-  }
-
-  function playStaticCrackle() {
-    staticOpacity.stopAnimation();
-    staticOpacity.setValue(0);
-    Animated.sequence([
-      Animated.timing(staticOpacity, {
-        toValue: 0.7,
-        duration: 50,
-        easing: Easing.out(Easing.quad),
-        useNativeDriver: true,
-      }),
-      Animated.timing(staticOpacity, {
-        toValue: 0.2,
-        duration: 80,
-        easing: Easing.inOut(Easing.quad),
-        useNativeDriver: true,
-      }),
-      Animated.timing(staticOpacity, {
-        toValue: 0.48,
-        duration: 70,
-        easing: Easing.out(Easing.quad),
-        useNativeDriver: true,
-      }),
-      Animated.timing(staticOpacity, {
-        toValue: 0,
-        duration: 80,
-        easing: Easing.in(Easing.quad),
-        useNativeDriver: true,
-      }),
-    ]).start();
   }
 
   function startListeningGlow() {
@@ -642,18 +739,16 @@ export default function HomeScreen() {
     ]).start();
   }
 
-  function startIntercomFlow() {
+  function prepareInteraction(requestId: number) {
     clearFlowTimers();
-    activeRequestId.current += 1;
-    const requestId = activeRequestId.current;
-    const chatMessage = getChatMessage();
-
+    activeRequestId.current = requestId;
     amberLoop.current?.stop();
     stopSpeechGlow();
     void unloadSpeechSound();
     setAnswerText(null);
     setErrorDetailText(null);
-    setIntercomState('idle');
+    staticOpacity.stopAnimation();
+    staticOpacity.setValue(0);
     Animated.parallel([
       Animated.timing(blueGlow, {
         toValue: 0,
@@ -668,21 +763,198 @@ export default function HomeScreen() {
         useNativeDriver: true,
       }),
     ]).start();
-    playStaticCrackle();
+  }
 
-    flowTimers.current = [
-      setTimeout(() => {
-        setIntercomState('listening');
-        startListeningGlow();
-      }, CRACKLE_DURATION),
-      setTimeout(() => {
-        staticOpacity.stopAnimation();
-        staticOpacity.setValue(0);
-        setIntercomState('thinking');
-        startThinkingGlow();
-        void askSeesam(chatMessage, requestId);
-      }, CRACKLE_DURATION + LISTENING_DURATION),
-    ];
+  function startProcessing() {
+    staticOpacity.stopAnimation();
+    staticOpacity.setValue(0);
+    setIntercomState('thinking');
+    startThinkingGlow();
+  }
+
+  async function processSpokenQuestion(audioUri: string, requestId: number) {
+    startProcessing();
+
+    let transcribedText = '';
+
+    try {
+      let transcription;
+
+      try {
+        transcription = await transcribeAudio(audioUri);
+      } catch (error) {
+        if (!isNetworkRequestFailed(error)) {
+          throw error;
+        }
+
+        devLog('transcribe retry 1');
+        await delay(TRANSCRIBE_RETRY_DELAY_MS);
+        transcription = await transcribeAudio(audioUri);
+      }
+
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      transcribedText = transcription.text.trim();
+
+      if (!transcribedText) {
+        throw new Error('Seesam ei kuullut kysymystä.');
+      }
+    } catch (error) {
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      showStepFailure('transcribe', error);
+      return;
+    }
+
+    setQuestionText(transcribedText);
+    await askSeesam(transcribedText, requestId);
+  }
+
+  async function startPushToTalk() {
+    if (recording.current || recordingStartInProgress.current || recordingStopInProgress.current) {
+      return;
+    }
+
+    const requestId = activeRequestId.current + 1;
+    recordingRequestId.current = requestId;
+    recordingStartInProgress.current = true;
+    recordingStartedAt.current = null;
+    recordingStopInProgress.current = false;
+    stopRecordingAfterStart.current = false;
+    prepareInteraction(requestId);
+    setIntercomState('listening');
+    startListeningGlow();
+
+    try {
+      const permission = await Audio.requestPermissionsAsync();
+
+      if (!permission.granted) {
+        throw new Error('Mikrofonin käyttöoikeutta ei myönnetty.');
+      }
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        staysActiveInBackground: false,
+        playThroughEarpieceAndroid: false,
+      });
+
+      const { recording: nextRecording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY,
+      );
+      recording.current = nextRecording;
+      recordingStartedAt.current = Date.now();
+      recordingStartInProgress.current = false;
+
+      if (stopRecordingAfterStart.current) {
+        stopRecordingAfterStart.current = false;
+        void stopPushToTalk();
+      }
+    } catch (error) {
+      recordingStartInProgress.current = false;
+      recordingRequestId.current = null;
+      recordingStartedAt.current = null;
+      recordingStopInProgress.current = false;
+      stopRecordingAfterStart.current = false;
+      recording.current = null;
+      void restorePlaybackAudioMode();
+
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      showStepFailure('recording', error, 'local-recording');
+    }
+  }
+
+  async function stopPushToTalk() {
+    if (recordingStopInProgress.current) {
+      return;
+    }
+
+    if (recordingStartInProgress.current) {
+      stopRecordingAfterStart.current = true;
+      return;
+    }
+
+    const currentRecording = recording.current;
+    const requestId = recordingRequestId.current;
+    const startedAt = recordingStartedAt.current;
+
+    if (!currentRecording || requestId === null) {
+      return;
+    }
+
+    recordingStopInProgress.current = true;
+    recording.current = null;
+    recordingRequestId.current = null;
+    recordingStartedAt.current = null;
+
+    const recordingDuration = startedAt === null ? 0 : Date.now() - startedAt;
+    const shouldCancelQuietly = recordingDuration < MIN_RECORDING_DURATION_MS;
+
+    if (shouldCancelQuietly) {
+      try {
+        await currentRecording.stopAndUnloadAsync();
+      } catch {
+      } finally {
+        recordingStopInProgress.current = false;
+        await restorePlaybackAudioMode();
+
+        if (activeRequestId.current === requestId) {
+          returnToIdle();
+        }
+      }
+
+      return;
+    }
+
+    try {
+      await currentRecording.stopAndUnloadAsync();
+      const audioUri = currentRecording.getURI();
+      await restorePlaybackAudioMode();
+
+      if (!audioUri) {
+        throw new Error('Tallennettua ääntä ei löytynyt.');
+      }
+
+      await waitForRecordingFileReady(audioUri);
+
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      devLog('Seesam recording upload start', { uri: audioUri });
+      void processSpokenQuestion(audioUri, requestId);
+    } catch (error) {
+      void restorePlaybackAudioMode();
+
+      if (activeRequestId.current !== requestId) {
+        return;
+      }
+
+      showStepFailure('recording', error, 'local-recording');
+    } finally {
+      recordingStopInProgress.current = false;
+    }
+  }
+
+  function submitTextQuestion() {
+    const chatMessage = questionText.trim();
+
+    if (!chatMessage) {
+      return;
+    }
+
+    const requestId = activeRequestId.current + 1;
+    prepareInteraction(requestId);
+    startProcessing();
+    void askSeesam(chatMessage, requestId);
   }
 
   return (
@@ -708,19 +980,44 @@ export default function HomeScreen() {
         <Text style={styles.title}>SEESAM</Text>
 
         <Animated.View
-          pointerEvents={maintenanceOpen ? "auto" : "none"}
+          pointerEvents={maintenanceMode ? "auto" : "none"}
           style={[
             styles.serviceConsole,
             { opacity: serviceConsoleOpacity },
           ]}
         >
           <Text style={styles.serviceTitle}>SERVICE CONSOLE</Text>
-          <ScrollView
-            contentContainerStyle={styles.serviceScrollContent}
-            nestedScrollEnabled
-            showsVerticalScrollIndicator={false}
-            style={styles.serviceScroll}
+          <Pressable
+            accessibilityLabel="Toggle text mode"
+            accessibilityRole="switch"
+            accessibilityState={{ checked: textMode }}
+            onPress={toggleTextMode}
+            style={[
+              styles.textModeToggle,
+              textMode && styles.textModeToggleActive,
+            ]}
           >
+            <View style={styles.textModeToggleText}>
+              <Text style={styles.serviceLabel}>TEXT MODE</Text>
+              <Text style={styles.textModeToggleValue}>
+                {textMode ? 'ENABLED' : 'DISABLED'}
+              </Text>
+            </View>
+            <View
+              style={[
+                styles.textModeToggleTrack,
+                textMode && styles.textModeToggleTrackActive,
+              ]}
+            >
+              <View
+                style={[
+                  styles.textModeToggleKnob,
+                  textMode && styles.textModeToggleKnobActive,
+                ]}
+              />
+            </View>
+          </Pressable>
+          <View style={styles.serviceStatusList}>
             {maintenanceStatus.error ? (
               <View style={styles.serviceLine}>
                 <View style={[styles.serviceLed, styles.serviceLedAmber]} />
@@ -755,7 +1052,7 @@ export default function HomeScreen() {
                 </View>
               ))
             )}
-          </ScrollView>
+          </View>
         </Animated.View>
 
         <Animated.View
@@ -796,63 +1093,74 @@ export default function HomeScreen() {
               ]}
             />
             <Pressable
-              accessibilityLabel={maintenanceOpen ? "Close maintenance mode" : "Open maintenance mode"}
+              accessibilityLabel={maintenanceMode ? "Close maintenance mode" : "Open maintenance mode"}
               delayLongPress={700}
               onLongPress={toggleMaintenanceMode}
               style={styles.speakerPressable}
             >
               <View style={styles.speakerHousing}>
                 <View style={styles.fabric}>
-                  <View style={styles.hatchGrille}>
-                    {GRILLE_BARS.map((bar) => (
-                      <View
-                        key={bar}
-                        style={[
-                          styles.grilleBar,
-                          {
-                            left: GRILLE_EDGE_INSET + bar * (GRILLE_BAR_WIDTH + GRILLE_GAP),
-                          },
-                        ]}
+                  {textMode ? (
+                    <View key="text-terminal" style={styles.terminalDisplay}>
+                      <View style={styles.terminalScanlines} />
+                      <Text style={styles.terminalHeader}>SEESAM TTY</Text>
+                      <View style={styles.terminalOutputArea}>
+                        <Text style={styles.terminalOutput}>{terminalOutput}</Text>
+                      </View>
+                      <TextInput
+                        accessibilityLabel="Seesam text mode input"
+                        autoCapitalize="sentences"
+                        onBlur={() => setInputFocused(false)}
+                        onChangeText={setQuestionText}
+                        onFocus={() => setInputFocused(true)}
+                        onSubmitEditing={submitTextQuestion}
+                        placeholder="TYPE MESSAGE"
+                        placeholderTextColor="#3f7d45"
+                        returnKeyType="send"
+                        style={styles.terminalInput}
+                        value={questionText}
                       />
-                    ))}
-                  </View>
+                    </View>
+                  ) : (
+                    <View key="speaker-grille" style={styles.hatchGrille}>
+                      {GRILLE_BARS.map((bar) => (
+                        <View
+                          key={bar}
+                          style={[
+                            styles.grilleBar,
+                            {
+                              left: GRILLE_EDGE_INSET + bar * (GRILLE_BAR_WIDTH + GRILLE_GAP),
+                            },
+                          ]}
+                        />
+                      ))}
+                    </View>
+                  )}
                 </View>
               </View>
             </Pressable>
           </View>
 
           <Text style={styles.status}>{STATUS_TEXT[intercomState]}</Text>
-          <Text style={styles.answer}>{answerText ?? " "}</Text>
-          {errorDetailText ? (
-            <Text style={styles.errorDetail}>{errorDetailText}</Text>
-          ) : null}
 
-          <View
-            style={[
-              styles.inputArea,
-              { transform: [{ translateY: inputAreaTranslateY }] },
-            ]}
+          <Animated.View
+            style={{
+              transform: [
+                { translateY: buttonTranslateY },
+                { translateY: textMode ? inputAreaTranslateY : 0 },
+              ],
+            }}
           >
-            <TextInput
-            accessibilityLabel="Seesam question"
-            autoCapitalize="sentences"
-            onBlur={() => setInputFocused(false)}
-            onChangeText={setQuestionText}
-            onFocus={() => setInputFocused(true)}
-            placeholder="Kysy Seesamilta..."
-            placeholderTextColor="#765233"
-            returnKeyType="done"
-            style={styles.questionInput}
-            value={questionText}
-          />
-          </View>
-
-          <Animated.View style={{ transform: [{ translateY: buttonTranslateY }] }}>
             <Pressable
               accessibilityLabel="Push to listen"
-              onPress={startIntercomFlow}
-              onPressIn={pressButton}
-              onPressOut={releaseButton}
+              onPressIn={() => {
+                pressButton();
+                void startPushToTalk();
+              }}
+              onPressOut={() => {
+                releaseButton();
+                void stopPushToTalk();
+              }}
               style={({ pressed }) => [
                 styles.buttonWell,
                 pressed && styles.buttonWellPressed,
@@ -1012,6 +1320,64 @@ const styles = StyleSheet.create({
     borderRadius: 98,
     overflow: 'hidden',
   },
+  terminalDisplay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#07100a',
+    borderColor: '#223b22',
+    borderRadius: 98,
+    borderWidth: 2,
+    overflow: 'hidden',
+    paddingBottom: 30,
+    paddingHorizontal: 20,
+    paddingTop: 24,
+  },
+  terminalScanlines: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(141, 245, 140, 0.04)',
+    borderRadius: 98,
+    borderTopColor: 'rgba(141, 245, 140, 0.18)',
+    borderTopWidth: 2,
+  },
+  terminalHeader: {
+    color: '#f0aa3c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0,
+    marginBottom: 5,
+    textAlign: 'center',
+  },
+  terminalOutputArea: {
+    height: 96,
+    marginBottom: 5,
+    maxHeight: 96,
+    minHeight: 0,
+  },
+  terminalOutput: {
+    color: '#8df58c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 11,
+    fontWeight: '700',
+    letterSpacing: 0,
+    lineHeight: 15,
+  },
+  terminalInput: {
+    backgroundColor: '#0b160d',
+    borderColor: '#315a31',
+    borderRadius: 5,
+    borderWidth: 1,
+    bottom: 20,
+    color: '#8df58c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 11,
+    fontWeight: '800',
+    height: 28,
+    left: 23,
+    letterSpacing: 0,
+    paddingHorizontal: 8,
+    position: 'absolute',
+    right: 23,
+  },
   frontCover: {
     alignItems: 'center',
     backgroundColor: '#d7b98c',
@@ -1047,11 +1413,65 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     paddingRight: 22,
   },
-  serviceScroll: {
-    flex: 1,
+  textModeToggle: {
+    alignItems: 'center',
+    borderColor: 'rgba(141, 245, 140, 0.22)',
+    borderRadius: 6,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
   },
-  serviceScrollContent: {
-    paddingBottom: 12,
+  textModeToggleActive: {
+    backgroundColor: 'rgba(141, 245, 140, 0.08)',
+    borderColor: 'rgba(141, 245, 140, 0.42)',
+  },
+  textModeToggleText: {
+    flex: 1,
+    paddingRight: 10,
+  },
+  textModeToggleValue: {
+    color: '#8df58c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0,
+  },
+  textModeToggleTrack: {
+    backgroundColor: '#1b241b',
+    borderColor: '#355033',
+    borderRadius: 10,
+    borderWidth: 1,
+    height: 20,
+    justifyContent: 'center',
+    paddingHorizontal: 2,
+    width: 38,
+  },
+  textModeToggleTrackActive: {
+    backgroundColor: '#244522',
+    borderColor: '#8df58c',
+  },
+  textModeToggleKnob: {
+    backgroundColor: '#f0aa3c',
+    borderRadius: 7,
+    height: 14,
+    shadowColor: '#f0aa3c',
+    shadowOffset: { height: 0, width: 0 },
+    shadowOpacity: 0.5,
+    shadowRadius: 4,
+    width: 14,
+  },
+  textModeToggleKnobActive: {
+    backgroundColor: '#8df58c',
+    shadowColor: '#8df58c',
+    transform: [{ translateX: 18 }],
+  },
+  serviceStatusList: {
+    height: 270,
+    maxHeight: 270,
+    minHeight: 0,
   },
   serviceLine: {
     alignItems: 'flex-start',

@@ -8,16 +8,25 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "android": {
-      "package": "com.seesam.app"
+      "package": "com.seesam.app",
+      "permissions": [
+        "RECORD_AUDIO"
+      ]
     },
     "plugins": [
       "expo-router"
     ],
     "extra": {
-      "seesamApiBaseUrl": "http://83.146.233.178:8000"
+      "lanApiBaseUrl": "http://<Seesam LAN IP>:8000",
+      "publicApiBaseUrl": "http://83.146.233.178:8000"
     },
     "experiments": {
       "typedRoutes": true
+    },
+    "ios": {
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Seesam tarvitsee mikrofonia push-to-talk-kysymyksiin."
+      }
     }
   }
 }
