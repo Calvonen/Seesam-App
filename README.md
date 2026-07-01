@@ -41,6 +41,29 @@ The Seesam API must be running on port 8000. Configure the API base URL in [app.
 }
 ```
 
+## Health Check
+
+The service console calls `GET /health` when it is opened and when the user presses `REFRESH`. The endpoint should return JSON with at least these fields:
+
+```json
+{
+  "server_online": true,
+  "memory_file_found": true,
+  "ollama": "ok",
+  "server_time": "2026-07-01T12:00:00Z",
+  "version": "dev"
+}
+```
+
+Backend expectations:
+
+- `memory_file_found` is `true` only when `memory/marko.local.txt` exists.
+- `ollama` is `"ok"` only when `http://127.0.0.1:11434/api/tags` responds successfully.
+- If Ollama does not respond, return HTTP 200 with `ollama: "offline"` or an object such as `{ "ok": false }`, so the app can show API online and Ollama offline separately.
+- `version` should always be present. Use `"dev"` if no commit or release version is available.
+
+If the `/health` request fails or returns a non-2xx response, the app marks the API server as offline and keeps showing the latest successful connection time.
+
 ## Features
 
 - Retro intercom UI

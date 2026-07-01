@@ -189,30 +189,192 @@ function pickServerStatusDetails(payload: unknown) {
 
 function readServerStatus(payload: unknown) {
   if (!payload || typeof payload !== 'object') {
-    return 'Tuntematon';
+    return 'Online';
   }
 
   const statusPayload = payload as Record<string, unknown>;
   const serverValue =
+    statusPayload.server_online ??
+    statusPayload.serverOnline ??
     statusPayload.server_status ??
     statusPayload.serverStatus ??
-    statusPayload.status ??
-    statusPayload.state ??
-    statusPayload.health;
-
-  if (typeof serverValue === 'string') {
-    return serverValue;
-  }
+    statusPayload.api;
 
   if (typeof serverValue === 'boolean') {
     return serverValue ? 'Online' : 'Offline';
   }
 
-  if (typeof serverValue === 'number') {
-    return String(serverValue);
+  if (typeof serverValue === 'string') {
+    const normalizedValue = serverValue.toLowerCase();
+
+    if (['false', 'offline', 'down', 'error', 'failed', 'stopped'].includes(normalizedValue)) {
+      return 'Offline';
+    }
+
+    if (['available', 'ok', 'online', 'running', 'true', 'up'].includes(normalizedValue)) {
+      return 'Online';
+    }
   }
 
-  return 'Saatavilla';
+  return 'Online';
+}
+
+function normalizeWhitespace(value: string) {
+  return value.trim().replace(/\s+/g, ' ');
+}
+
+function stripTrailingSentencePunctuation(value: string) {
+  let strippedValue = value.trim();
+
+  while (
+    strippedValue.endsWith('.') ||
+    strippedValue.endsWith('!') ||
+    strippedValue.endsWith('?')
+  ) {
+    strippedValue = strippedValue.slice(0, -1).trim();
+  }
+
+  return strippedValue;
+}
+
+function normalizeCommandText(value: string) {
+  return stripTrailingSentencePunctuation(normalizeWhitespace(value)).toLocaleLowerCase('fi-FI');
+}
+
+function normalizeLatestMemoryDeleteCommand(message: string) {
+  const text = normalizeCommandText(message);
+  const deleteLatestPhrases = [
+    'poista viimeisin muisto',
+    'poista viimeisin muistosi',
+    'poista viimeinen muisto',
+    'poista edellinen muisto',
+    'poista uusin muisto',
+    'unohda viimeisin muisto',
+    'unohda viimeisin muistosi',
+    'unohda viimeinen muisto',
+    'unohda edellinen muisto',
+    'peru viimeisin muisto',
+    'peru viimeisin muistosi',
+    'peru viimeisin tallennus',
+    'peru viimeksi tallennettu muisto',
+    'kumoa viimeisin muisto',
+    'kumoa viimeisin tallennus',
+    'unohda mitä viimeksi muistit',
+  ];
+
+  if (deleteLatestPhrases.some((phrase) => text.includes(phrase))) {
+    return 'poista viimeisin muisto';
+  }
+
+  return null;
+}
+
+function removeProfileCommandPrefix(value: string) {
+  const lowerValue = value.toLocaleLowerCase('fi-FI');
+  const prefixes = [
+    'muista että ',
+    'muista ',
+    'tallenna että ',
+    'tallenna muistiin ',
+    'tallenna ',
+    'kirjaa että ',
+    'kirjaa muistiin ',
+    'kirjaa ',
+  ];
+
+  for (const prefix of prefixes) {
+    if (lowerValue.startsWith(prefix)) {
+      return value.slice(prefix.length).trim();
+    }
+  }
+
+  return value;
+}
+
+function trimMatchingQuotes(value: string) {
+  let trimmedValue = value.trim();
+  const quoteCharacters = ['"', "'", '“', '”', '‘', '’'];
+
+  while (trimmedValue.length > 0 && quoteCharacters.includes(trimmedValue[0])) {
+    trimmedValue = trimmedValue.slice(1).trim();
+  }
+
+  while (
+    trimmedValue.length > 0 &&
+    quoteCharacters.includes(trimmedValue[trimmedValue.length - 1])
+  ) {
+    trimmedValue = trimmedValue.slice(0, -1).trim();
+  }
+
+  return trimmedValue;
+}
+
+function cleanProfileName(rawName: string) {
+  const cleanedName = trimMatchingQuotes(stripTrailingSentencePunctuation(normalizeWhitespace(rawName)));
+  const lowerName = cleanedName.toLocaleLowerCase('fi-FI');
+  const blockedJoiners = [' mutta ', ' koska ', ' joten ', ' ja '];
+
+  if (
+    cleanedName.length < 2 ||
+    cleanedName.length > 60 ||
+    cleanedName.includes('?') ||
+    cleanedName.includes('/') ||
+    cleanedName.includes(':') ||
+    cleanedName.includes(';') ||
+    blockedJoiners.some((joiner) => lowerName.includes(joiner))
+  ) {
+    return null;
+  }
+
+  return cleanedName;
+}
+
+function extractProfileName(message: string) {
+  const normalizedMessage = stripTrailingSentencePunctuation(normalizeWhitespace(message));
+  const profileText = removeProfileCommandPrefix(normalizedMessage);
+  const lowerProfileText = profileText.toLocaleLowerCase('fi-FI');
+  const namePrefixes = [
+    'minun nimeni on ',
+    'mun nimeni on ',
+    'nimeni on ',
+    'minä olen nimeltä ',
+    'mä olen nimeltä ',
+    'olen nimeltä ',
+    'minua kutsutaan ',
+    'mua kutsutaan ',
+    'minua voi kutsua ',
+    'mua voi kutsua ',
+    'minä olen ',
+    'mä olen ',
+  ];
+
+  for (const prefix of namePrefixes) {
+    if (lowerProfileText.startsWith(prefix)) {
+      return cleanProfileName(profileText.slice(prefix.length));
+    }
+  }
+
+  return null;
+}
+
+function normalizeUserNameProfile(message: string) {
+  const profileName = extractProfileName(message);
+
+  if (profileName) {
+    return 'Käyttäjäprofiili: Käyttäjän nimi on ' + profileName + '.';
+  }
+
+  return null;
+}
+
+function normalizeChatMessageForSeesam(message: string) {
+  const normalizedMessage = normalizeWhitespace(message);
+
+  return (
+    normalizeLatestMemoryDeleteCommand(normalizedMessage) ??
+    normalizeUserNameProfile(normalizedMessage) ??
+    normalizedMessage
+  );
 }
 
 async function readErrorBody(response: Response) {
@@ -226,7 +388,7 @@ async function readErrorBody(response: Response) {
 export async function getServerStatus(): Promise<ServerStatusResponse> {
   const response = await fetchFromSeesamApi(
     'status',
-    '/status',
+    '/health',
     () => ({
       method: 'GET',
       headers: {
@@ -306,10 +468,10 @@ export async function sendChatMessage(message: string): Promise<ChatResponse> {
         Accept: 'application/json',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message: normalizeChatMessageForSeesam(message) }),
     }),
     (response, errorBody) =>
-      `Seesam API request failed with ${response.status} ${response.statusText}. ${errorBody}`.trim(),
+      ('Seesam API request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
   );
   const payload: unknown = await response.json();
 

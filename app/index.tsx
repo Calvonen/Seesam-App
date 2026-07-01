@@ -37,15 +37,11 @@ const GRILLE_GAP =
 const GRILLE_BARS = Array.from({ length: GRILLE_BAR_COUNT }, (_, index) => index);
 const STATIC_LINES = Array.from({ length: 18 }, (_, index) => index);
 const SERVICE_STATUS_FIELDS = [
-  { label: 'API', keys: ['api', 'serverStatus', 'server_status', 'status', 'health'] },
+  { label: 'API', keys: ['api', 'serverOnline', 'server_online', 'serverStatus', 'server_status', 'status', 'health'] },
+  { label: 'Memory File', keys: ['memoryFile', 'memory_file', 'memoryFound', 'memory_found', 'memoryFileFound', 'memory_file_found'] },
   { label: 'Ollama', keys: ['ollama'] },
-  { label: 'Piper', keys: ['piper'] },
-  { label: 'SSH', keys: ['ssh'] },
-  { label: 'Fail2Ban', keys: ['fail2ban', 'fail_2_ban'] },
-  { label: 'CPU', keys: ['cpu', 'processor'] },
-  { label: 'RAM', keys: ['ram', 'memory', 'mem'] },
-  { label: 'Disk', keys: ['disk', 'storage'] },
-  { label: 'IP', keys: ['ip_address', 'ipAddress', 'ip', 'address'] },
+  { label: 'Server Time', keys: ['serverTime', 'server_time', 'timestamp', 'time'] },
+  { label: 'Version', keys: ['version', 'apiVersion', 'api_version', 'commit', 'commitSha', 'commit_sha'] },
 ];
 
 type IntercomState = 'idle' | 'listening' | 'thinking';
@@ -61,6 +57,7 @@ type MaintenanceStatusState = {
   detailRows: StatusRow[];
   error: string | null;
   updatedAt: string | null;
+  lastSuccessfulConnectionAt: string | null;
 };
 
 type PushToTalkStep = 'recording' | 'transcribe' | 'chat' | 'speak' | 'playback';
@@ -94,6 +91,7 @@ const EMPTY_MAINTENANCE_STATUS: MaintenanceStatusState = {
   loading: false,
   status: null,
   updatedAt: null,
+  lastSuccessfulConnectionAt: null,
 };
 
 export default function HomeScreen() {
@@ -105,9 +103,6 @@ export default function HomeScreen() {
   const [errorDetailText, setErrorDetailText] = useState<string | null>(null);
   const [questionText, setQuestionText] = useState('');
   const [textMode, setTextMode] = useState(false);
-  const [keyboardVisible, setKeyboardVisible] = useState(false);
-  const [inputFocused, setInputFocused] = useState(false);
-  const [keyboardHeight, setKeyboardHeight] = useState(0);
   const staticOpacity = useRef(new Animated.Value(0)).current;
   const blueGlow = useRef(new Animated.Value(0)).current;
   const amberGlow = useRef(new Animated.Value(0)).current;
@@ -137,18 +132,6 @@ export default function HomeScreen() {
       playThroughEarpieceAndroid: false,
     });
 
-    const keyboardDidShow = Keyboard.addListener('keyboardDidShow', (event) => {
-      setKeyboardVisible(true);
-      setKeyboardHeight(event.endCoordinates.height);
-    });
-    const keyboardDidHide = Keyboard.addListener('keyboardDidHide', () => {
-      setKeyboardVisible(false);
-      setInputFocused(false);
-      setKeyboardHeight(0);
-      requestAnimationFrame(() => {
-        scrollViewRef.current?.scrollTo({ y: 0, animated: true });
-      });
-    });
 
     return () => {
       activeRequestId.current += 1;
@@ -158,8 +141,6 @@ export default function HomeScreen() {
       void speechSound.current?.unloadAsync();
       void recording.current?.stopAndUnloadAsync();
       flowTimers.current.forEach(clearTimeout);
-      keyboardDidShow.remove();
-      keyboardDidHide.remove();
     };
   }, []);
 
@@ -193,11 +174,7 @@ export default function HomeScreen() {
     outputRange: [0.99, 1.035],
   });
 
-  const keyboardActive = keyboardVisible || inputFocused;
-  const inputAreaTranslateY =
-    Platform.OS === 'android' && keyboardVisible
-      ? -Math.min(keyboardHeight * 0.55, 190)
-      : 0;
+  const textModeHasMessage = questionText.trim().length > 0;
   const terminalOutput = errorDetailText ?? answerText ?? 'TEXT LINK READY';
 
 
@@ -463,33 +440,91 @@ export default function HomeScreen() {
     return undefined;
   }
 
-  function getServiceLedStyle(value: string) {
-    const normalizedValue = value.toLowerCase();
-
-    if (
-      value === '-' ||
-      normalizedValue.includes('offline') ||
-      normalizedValue.includes('down') ||
-      normalizedValue.includes('error') ||
-      normalizedValue.includes('fail') ||
-      normalizedValue.includes('stopped')
-    ) {
-      return styles.serviceLedAmber;
+  function readNestedStatusValue(value: unknown) {
+    if (!value || typeof value !== 'object') {
+      return value;
     }
 
-    return styles.serviceLedGreen;
+    const statusValue = findStatusValue(value, ['ok', 'online', 'found', 'exists', 'present', 'status', 'state', 'health']);
+
+    return statusValue ?? value;
+  }
+
+  function getBooleanStatusText(value: unknown, trueText: string, falseText: string) {
+    const statusValue = readNestedStatusValue(value);
+
+    if (typeof statusValue === 'boolean') {
+      return statusValue ? trueText : falseText;
+    }
+
+    if (typeof statusValue === 'string') {
+      const normalizedValue = statusValue.toLowerCase();
+
+      if (['available', 'found', 'ok', 'online', 'present', 'running', 'true', 'up'].includes(normalizedValue)) {
+        return trueText;
+      }
+
+      if (['false', 'missing', 'offline', 'down', 'error', 'failed', 'stopped'].includes(normalizedValue)) {
+        return falseText;
+      }
+    }
+
+    return formatStatusValue(statusValue);
+  }
+
+  function getStatusRowValue(label: string, rawValue: unknown, status: ServerStatusResponse) {
+    if (label === 'API') {
+      return status.serverStatus;
+    }
+
+    if (label === 'Memory File') {
+      return getBooleanStatusText(rawValue, 'Found', 'Missing');
+    }
+
+    if (label === 'Ollama') {
+      return getBooleanStatusText(rawValue, 'OK', 'Offline');
+    }
+
+    if (label === 'Version' && (rawValue === null || rawValue === undefined || rawValue === '')) {
+      return 'dev';
+    }
+
+    return formatStatusValue(rawValue);
+  }
+
+  function getServiceLedStyle(label: string, value: string) {
+    const normalizedLabel = label.toLowerCase();
+    const normalizedValue = value.toLowerCase();
+
+    if (normalizedLabel === 'server time' || normalizedLabel === 'version') {
+      return value === '-' ? styles.serviceLedAmber : styles.serviceLedGreen;
+    }
+
+    if (normalizedLabel === 'api') {
+      return normalizedValue === 'online' ? styles.serviceLedGreen : styles.serviceLedAmber;
+    }
+
+    if (normalizedLabel === 'memory file') {
+      return normalizedValue === 'found' ? styles.serviceLedGreen : styles.serviceLedAmber;
+    }
+
+    if (normalizedLabel === 'ollama') {
+      return normalizedValue === 'ok' ? styles.serviceLedGreen : styles.serviceLedAmber;
+    }
+
+    return styles.serviceLedAmber;
   }
 
   function getServerStatusRows(status: ServerStatusResponse) {
     return SERVICE_STATUS_FIELDS.map((field) => {
-      const value =
+      const rawValue =
         field.label === 'API'
-          ? findStatusValue(status.details, field.keys) ?? status.serverStatus
+          ? status.serverStatus
           : findStatusValue(status.details, field.keys);
 
       return {
         label: field.label,
-        value: formatStatusValue(value),
+        value: getStatusRowValue(field.label, rawValue, status),
       };
     });
   }
@@ -506,6 +541,13 @@ export default function HomeScreen() {
 
     try {
       const serverStatus = await getServerStatus();
+      const successfulConnectionAt = new Date().toLocaleString('fi-FI', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        day: '2-digit',
+        month: '2-digit',
+      });
 
       if (statusRequestId.current !== requestId) {
         return;
@@ -516,29 +558,29 @@ export default function HomeScreen() {
         error: null,
         loading: false,
         status: serverStatus.serverStatus,
-        updatedAt: new Date().toLocaleTimeString('fi-FI', {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
+        updatedAt: successfulConnectionAt,
+        lastSuccessfulConnectionAt: successfulConnectionAt,
       });
     } catch (error) {
       if (statusRequestId.current !== requestId) {
         return;
       }
 
-      setMaintenanceStatus({
-        detailRows: [],
+      setMaintenanceStatus((currentStatus) => ({
+        detailRows: [
+          { label: 'API', value: 'Offline' },
+        ],
         error: getErrorMessage(error),
         loading: false,
-        status: null,
-        updatedAt: null,
-      });
+        status: 'Offline',
+        updatedAt: currentStatus.updatedAt,
+        lastSuccessfulConnectionAt: currentStatus.lastSuccessfulConnectionAt,
+      }));
     }
   }
 
   function openMaintenanceMode() {
     setMaintenanceMode(true);
-    void refreshMaintenanceStatus();
     Animated.timing(hatchProgress, {
       toValue: 1,
       duration: 950,
@@ -568,13 +610,26 @@ export default function HomeScreen() {
     openMaintenanceMode();
   }
 
+  useEffect(() => {
+    if (!maintenanceMode) {
+      return undefined;
+    }
+
+    void refreshMaintenanceStatus();
+
+    return () => {
+      statusRequestId.current += 1;
+    };
+    // refreshMaintenanceStatus only uses component-local stable refs and setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [maintenanceMode]);
+
   function toggleTextMode() {
     setTextMode((enabled) => {
       const nextEnabled = !enabled;
 
       if (!nextEnabled) {
         Keyboard.dismiss();
-        setInputFocused(false);
       }
 
       return nextEnabled;
@@ -944,7 +999,7 @@ export default function HomeScreen() {
     }
   }
 
-  function submitTextQuestion() {
+  function sendMessage() {
     const chatMessage = questionText.trim();
 
     if (!chatMessage) {
@@ -961,14 +1016,11 @@ export default function HomeScreen() {
     <TouchableWithoutFeedback accessible={false} onPress={Keyboard.dismiss}>
       <View style={styles.screen}>
         <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      style={styles.screen}
-    >
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={styles.screen}
+        >
       <ScrollView
-        contentContainerStyle={[
-          styles.screenScroll,
-          Platform.OS === 'ios' && keyboardActive && styles.screenScrollKeyboard,
-        ]}
+        contentContainerStyle={styles.screenScroll}
         ref={scrollViewRef}
         style={styles.screenScroller}
         endFillColor="#17120f"
@@ -986,7 +1038,22 @@ export default function HomeScreen() {
             { opacity: serviceConsoleOpacity },
           ]}
         >
-          <Text style={styles.serviceTitle}>SERVICE CONSOLE</Text>
+          <View style={styles.serviceHeader}>
+            <Text style={styles.serviceTitle}>SERVICE CONSOLE</Text>
+            <Pressable
+              accessibilityLabel="Refresh service status"
+              disabled={maintenanceStatus.loading}
+              onPress={() => {
+                void refreshMaintenanceStatus();
+              }}
+              style={[
+                styles.serviceRefreshButton,
+                maintenanceStatus.loading && styles.serviceRefreshButtonDisabled,
+              ]}
+            >
+              <Text style={styles.serviceRefreshButtonText}>REFRESH</Text>
+            </Pressable>
+          </View>
           <Pressable
             accessibilityLabel="Toggle text mode"
             accessibilityRole="switch"
@@ -1018,6 +1085,15 @@ export default function HomeScreen() {
             </View>
           </Pressable>
           <View style={styles.serviceStatusList}>
+            {maintenanceStatus.lastSuccessfulConnectionAt ? (
+              <View style={styles.serviceLine}>
+                <View style={[styles.serviceLed, styles.serviceLedAmber]} />
+                <View style={styles.serviceTextGroup}>
+                  <Text style={styles.serviceLabel}>LAST OK</Text>
+                  <Text style={styles.serviceValue}>{maintenanceStatus.lastSuccessfulConnectionAt}</Text>
+                </View>
+              </View>
+            ) : null}
             {maintenanceStatus.error ? (
               <View style={styles.serviceLine}>
                 <View style={[styles.serviceLed, styles.serviceLedAmber]} />
@@ -1042,7 +1118,7 @@ export default function HomeScreen() {
                   <View
                     style={[
                       styles.serviceLed,
-                      getServiceLedStyle(row.value),
+                      getServiceLedStyle(row.label, row.value),
                     ]}
                   />
                   <View style={styles.serviceTextGroup}>
@@ -1110,14 +1186,14 @@ export default function HomeScreen() {
                       <TextInput
                         accessibilityLabel="Seesam text mode input"
                         autoCapitalize="sentences"
-                        onBlur={() => setInputFocused(false)}
+                        blurOnSubmit={false}
+                        multiline
                         onChangeText={setQuestionText}
-                        onFocus={() => setInputFocused(true)}
-                        onSubmitEditing={submitTextQuestion}
                         placeholder="TYPE MESSAGE"
                         placeholderTextColor="#3f7d45"
-                        returnKeyType="send"
+                        scrollEnabled
                         style={styles.terminalInput}
+                        textAlignVertical="top"
                         value={questionText}
                       />
                     </View>
@@ -1147,26 +1223,43 @@ export default function HomeScreen() {
             style={{
               transform: [
                 { translateY: buttonTranslateY },
-                { translateY: textMode ? inputAreaTranslateY : 0 },
               ],
             }}
           >
             <Pressable
-              accessibilityLabel="Push to listen"
+              accessibilityLabel={textMode ? "Send text mode message" : "Push to listen"}
+              disabled={textMode && !textModeHasMessage}
               onPressIn={() => {
                 pressButton();
+
+                if (textMode) {
+                  sendMessage();
+                  return;
+                }
+
                 void startPushToTalk();
               }}
               onPressOut={() => {
                 releaseButton();
+
+                if (textMode) {
+                  return;
+                }
+
                 void stopPushToTalk();
               }}
               style={({ pressed }) => [
                 styles.buttonWell,
                 pressed && styles.buttonWellPressed,
+                textMode && !textModeHasMessage && styles.buttonWellDisabled,
               ]}
             >
-              <View style={styles.pushButton}>
+              <View
+                style={[
+                  styles.pushButton,
+                  textMode && !textModeHasMessage && styles.pushButtonDisabled,
+                ]}
+              >
                 <View style={styles.brushedBandTop} />
                 <View style={styles.brushedBandMiddle} />
                 <View style={styles.brushedBandBottom} />
@@ -1218,10 +1311,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 22,
     paddingBottom: 22,
-  },
-  screenScrollKeyboard: {
-    justifyContent: 'flex-start',
-    paddingBottom: 48,
   },
   device: {
     alignItems: 'center',
@@ -1327,7 +1416,7 @@ const styles = StyleSheet.create({
     borderRadius: 98,
     borderWidth: 2,
     overflow: 'hidden',
-    paddingBottom: 30,
+    paddingBottom: 78,
     paddingHorizontal: 20,
     paddingTop: 24,
   },
@@ -1348,9 +1437,9 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   terminalOutputArea: {
-    height: 96,
+    height: 86,
     marginBottom: 5,
-    maxHeight: 96,
+    maxHeight: 86,
     minHeight: 0,
   },
   terminalOutput: {
@@ -1366,18 +1455,23 @@ const styles = StyleSheet.create({
     borderColor: '#315a31',
     borderRadius: 5,
     borderWidth: 1,
-    bottom: 20,
+    bottom: 22,
     color: '#8df58c',
     fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
     fontSize: 11,
     fontWeight: '800',
-    height: 28,
-    left: 23,
+    left: 22,
     letterSpacing: 0,
+    lineHeight: 15,
+    maxHeight: 80,
+    minHeight: 44,
     paddingHorizontal: 8,
+    paddingTop: 7,
+    paddingBottom: 7,
     position: 'absolute',
-    right: 23,
+    right: 22,
   },
+
   frontCover: {
     alignItems: 'center',
     backgroundColor: '#d7b98c',
@@ -1404,14 +1498,39 @@ const styles = StyleSheet.create({
     top: 116,
     zIndex: 1,
   },
+  serviceHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
   serviceTitle: {
     color: '#8df58c',
+    flexShrink: 1,
     fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
     fontSize: 11,
     fontWeight: '800',
     letterSpacing: 0,
-    marginBottom: 6,
-    paddingRight: 22,
+    paddingRight: 10,
+  },
+  serviceRefreshButton: {
+    alignItems: 'center',
+    borderColor: 'rgba(141, 245, 140, 0.42)',
+    borderRadius: 5,
+    borderWidth: 1,
+    height: 24,
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  serviceRefreshButtonDisabled: {
+    opacity: 0.55,
+  },
+  serviceRefreshButtonText: {
+    color: '#8df58c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 0,
   },
   textModeToggle: {
     alignItems: 'center',
@@ -1600,6 +1719,9 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.22,
     shadowRadius: 4,
   },
+  buttonWellDisabled: {
+    opacity: 0.56,
+  },
   pushButton: {
     backgroundColor: '#bfc0bb',
     borderColor: '#555854',
@@ -1612,6 +1734,10 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.32,
     shadowRadius: 5,
     width: 96,
+  },
+  pushButtonDisabled: {
+    backgroundColor: '#8f918d',
+    borderColor: '#686b67',
   },
   brushedBandTop: {
     backgroundColor: 'rgba(255, 255, 248, 0.32)',
