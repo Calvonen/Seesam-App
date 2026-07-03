@@ -18,7 +18,7 @@
     ],
     "extra": {
       "lanApiBaseUrl": "http://<Seesam LAN IP>:8000",
-      "publicApiBaseUrl": "http://83.146.233.178:8000"
+      "publicApiBaseUrl": "http://192.168.68.75:8000"
     },
     "experiments": {
       "typedRoutes": true

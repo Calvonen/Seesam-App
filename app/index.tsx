@@ -79,11 +79,6 @@ const STEP_ERROR_TEXT: Record<PushToTalkStep, string> = {
   playback: 'Äänen toisto epäonnistui.',
 };
 
-function devLog(...messages: unknown[]) {
-  if (__DEV__) {
-    console.log(...messages);
-  }
-}
 
 const EMPTY_MAINTENANCE_STATUS: MaintenanceStatusState = {
   detailRows: [],
@@ -116,6 +111,8 @@ export default function HomeScreen() {
   const speechGlow = useRef(new Animated.Value(0)).current;
   const speechGlowLoop = useRef<Animated.CompositeAnimation | null>(null);
   const speechSound = useRef<Audio.Sound | null>(null);
+  const speechAudioUri = useRef<string | null>(null);
+  const speechAudioSequence = useRef(0);
   const recording = useRef<Audio.Recording | null>(null);
   const recordingRequestId = useRef<number | null>(null);
   const recordingStartInProgress = useRef(false);
@@ -138,7 +135,7 @@ export default function HomeScreen() {
       statusRequestId.current += 1;
       amberLoop.current?.stop();
       speechGlowLoop.current?.stop();
-      void speechSound.current?.unloadAsync();
+      void unloadSpeechSound();
       void recording.current?.stopAndUnloadAsync();
       flowTimers.current.forEach(clearTimeout);
     };
@@ -219,11 +216,6 @@ export default function HomeScreen() {
 
       const fileReadiness = await getRecordingFileReadiness(audioUri);
 
-      devLog('Seesam recording file', {
-        exists: fileReadiness.exists,
-        size: fileReadiness.size,
-        uri: audioUri,
-      });
 
       if (fileReadiness.exists && fileReadiness.size > 0) {
         return;
@@ -260,13 +252,53 @@ export default function HomeScreen() {
 
   async function unloadSpeechSound() {
     const currentSound = speechSound.current;
+    const currentAudioUri = speechAudioUri.current;
+
+    speechSound.current = null;
+    speechAudioUri.current = null;
 
     if (!currentSound) {
+      if (currentAudioUri) {
+        await FileSystem.deleteAsync(currentAudioUri, { idempotent: true });
+      }
       return;
     }
 
-    speechSound.current = null;
     await currentSound.unloadAsync();
+
+    if (currentAudioUri) {
+      await FileSystem.deleteAsync(currentAudioUri, { idempotent: true });
+    }
+  }
+
+  async function deleteCachedSpeechAudioFiles() {
+    const cacheDirectory = FileSystem.cacheDirectory;
+
+    if (!cacheDirectory) {
+      return;
+    }
+
+    const cachedFiles = await FileSystem.readDirectoryAsync(cacheDirectory);
+
+    await Promise.all(
+      cachedFiles
+        .filter((fileName) => fileName.startsWith("seesam-answer-") && fileName.endsWith(".wav"))
+        .map((fileName) => FileSystem.deleteAsync(cacheDirectory + fileName, { idempotent: true })),
+    );
+  }
+
+  function createSpeechAudioUri(requestId: number) {
+    speechAudioSequence.current += 1;
+    return (
+      FileSystem.cacheDirectory +
+      "seesam-answer-" +
+      requestId +
+      "-" +
+      speechAudioSequence.current +
+      "-" +
+      Date.now() +
+      ".wav"
+    );
   }
 
   function startSpeechGlow() {
@@ -317,6 +349,7 @@ export default function HomeScreen() {
   async function playAnswerAudio(answer: string, requestId: number) {
     try {
       await unloadSpeechSound();
+      await deleteCachedSpeechAudioFiles();
     } catch (error) {
       if (activeRequestId.current !== requestId) {
         return;
@@ -344,21 +377,32 @@ export default function HomeScreen() {
     }
 
     try {
-      const audioUri = FileSystem.cacheDirectory + "seesam-answer-" + requestId + ".wav";
+      const audioUri = createSpeechAudioUri(requestId);
+      await FileSystem.deleteAsync(audioUri, { idempotent: true });
       await FileSystem.writeAsStringAsync(audioUri, arrayBufferToBase64(speechAudio.audio), {
         encoding: FileSystem.EncodingType.Base64,
       });
 
       if (activeRequestId.current !== requestId) {
+        await FileSystem.deleteAsync(audioUri, { idempotent: true });
         return;
       }
 
       const { sound } = await Audio.Sound.createAsync(
         { uri: audioUri },
-        { shouldPlay: true },
+        { shouldPlay: false },
       );
+
+      if (activeRequestId.current !== requestId) {
+        await sound.unloadAsync();
+        await FileSystem.deleteAsync(audioUri, { idempotent: true });
+        return;
+      }
+
       speechSound.current = sound;
+      speechAudioUri.current = audioUri;
       startSpeechGlow();
+      await sound.playAsync();
 
       sound.setOnPlaybackStatusUpdate((playbackStatus) => {
         if (!playbackStatus.isLoaded) {
@@ -842,7 +886,6 @@ export default function HomeScreen() {
           throw error;
         }
 
-        devLog('transcribe retry 1');
         await delay(TRANSCRIBE_RETRY_DELAY_MS);
         transcription = await transcribeAudio(audioUri);
       }
@@ -984,7 +1027,6 @@ export default function HomeScreen() {
         return;
       }
 
-      devLog('Seesam recording upload start', { uri: audioUri });
       void processSpokenQuestion(audioUri, requestId);
     } catch (error) {
       void restorePlaybackAudioMode();

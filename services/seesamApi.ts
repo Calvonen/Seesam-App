@@ -1,12 +1,7 @@
 import Constants from 'expo-constants';
 
-const DEFAULT_PUBLIC_API_BASE_URL = 'http://83.146.233.178:8000';
+const DEFAULT_PUBLIC_API_BASE_URL = 'http://192.168.68.75:8000';
 
-function devLog(...messages: unknown[]) {
-  if (__DEV__) {
-    console.log(...messages);
-  }
-}
 
 type ExpoExtra = {
   lanApiBaseUrl?: string;
@@ -104,7 +99,6 @@ async function fetchFromSeesamApi(
     lastRequestUrl = requestUrl;
 
     try {
-      devLog('Seesam API URL used:', requestUrl);
       const response = await fetch(requestUrl, requestInit());
 
       if (!response.ok) {
@@ -410,14 +404,16 @@ export async function getSpeechAudio(text: string): Promise<SpeechAudioResponse>
   const response = await fetchFromSeesamApi(
     'speak',
     '/speak',
-    () => ({
-      method: 'POST',
-      headers: {
-        Accept: 'audio/wav',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ text }),
-    }),
+    () => {
+      return {
+        method: 'POST',
+        headers: {
+          Accept: 'audio/wav',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text }),
+      };
+    },
     (response, errorBody) =>
       ('Seesam speak request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
   );
@@ -452,9 +448,10 @@ export async function transcribeAudio(audioUri: string): Promise<TranscribeRespo
       ('Seesam transcribe request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
   );
   const payload: unknown = await response.json();
+  const transcribedText = readTranscription(payload);
 
   return {
-    text: readTranscription(payload),
+    text: transcribedText,
   };
 }
 
@@ -462,20 +459,24 @@ export async function sendChatMessage(message: string): Promise<ChatResponse> {
   const response = await fetchFromSeesamApi(
     'chat',
     '/chat',
-    () => ({
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ message: normalizeChatMessageForSeesam(message) }),
-    }),
+    () => {
+      const normalizedMessage = normalizeChatMessageForSeesam(message);
+      return {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ message: normalizedMessage }),
+      };
+    },
     (response, errorBody) =>
       ('Seesam API request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
   );
   const payload: unknown = await response.json();
+  const answer = readAnswer(payload);
 
   return {
-    answer: readAnswer(payload),
+    answer,
   };
 }
