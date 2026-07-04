@@ -17,8 +17,9 @@
       "expo-router"
     ],
     "extra": {
-      "lanApiBaseUrl": "http://<Seesam LAN IP>:8000",
-      "publicApiBaseUrl": "http://192.168.68.75:8000"
+      "lanApiBaseUrl": "http://192.168.68.75:8000",
+      "publicApiBaseUrl": "http://100.90.126.101:8000",
+      "tailscaleApiBaseUrl": "http://100.90.126.101:8000"
     },
     "experiments": {
       "typedRoutes": true

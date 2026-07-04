@@ -29,17 +29,18 @@ Then open the project in Expo Go or your simulator/emulator.
 
 ## Backend
 
-The Seesam API must be running on port 8000. Configure the API base URL in [app.json](./app.json) under `extra.seesamApiBaseUrl`:
+The Seesam API must be running on port 8000. The app tries the LAN API first with a short `/health` check, then falls back to the Tailscale API if LAN is not reachable.
 
-```json
-{
-  "expo": {
-    "extra": {
-      "seesamApiBaseUrl": "http://YOUR_SERVER_IP:8000"
-    }
-  }
-}
+Copy [.env.example](./.env.example) to `.env` if you want to use your own addresses:
+
+```sh
+EXPO_PUBLIC_SEESAM_LAN_API_URL=http://192.168.68.75:8000
+EXPO_PUBLIC_SEESAM_TAILSCALE_API_URL=http://100.90.126.101:8000
 ```
+
+At home, the app uses the LAN address without requiring Tailscale on the phone. Outside home, keep Tailscale enabled on the phone so the app can reach the Tailscale address.
+
+Fallbacks can also be configured in [app.json](./app.json) under `extra.lanApiBaseUrl` and `extra.tailscaleApiBaseUrl`.
 
 ## Health Check
 
