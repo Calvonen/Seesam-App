@@ -17,12 +17,13 @@ import {
 } from 'react-native';
 
 import {
-  getServerStatus,
+  getDashboard,
   getSpeechAudio,
   sendChatMessage,
   transcribeAudio,
   SeesamRequestError,
-  type ServerStatusResponse,
+  type DashboardItemState,
+  type DashboardResponse,
 } from '../services/seesamApi';
 
 const SPEAKER_OPENING_SIZE = 208;
@@ -36,19 +37,13 @@ const GRILLE_GAP =
   (GRILLE_BAR_COUNT - 1);
 const GRILLE_BARS = Array.from({ length: GRILLE_BAR_COUNT }, (_, index) => index);
 const STATIC_LINES = Array.from({ length: 18 }, (_, index) => index);
-const SERVICE_STATUS_FIELDS = [
-  { label: 'API', keys: ['api', 'serverOnline', 'server_online', 'serverStatus', 'server_status', 'status', 'health'] },
-  { label: 'Memory File', keys: ['memoryFile', 'memory_file', 'memoryFound', 'memory_found', 'memoryFileFound', 'memory_file_found'] },
-  { label: 'Ollama', keys: ['ollama'] },
-  { label: 'Server Time', keys: ['serverTime', 'server_time', 'timestamp', 'time'] },
-  { label: 'Version', keys: ['version', 'apiVersion', 'api_version', 'commit', 'commitSha', 'commit_sha'] },
-];
 
 type IntercomState = 'idle' | 'listening' | 'thinking';
 
 type StatusRow = {
   label: string;
   value: string;
+  state?: DashboardItemState | string;
 };
 
 type MaintenanceStatusState = {
@@ -516,27 +511,109 @@ export default function HomeScreen() {
     return formatStatusValue(statusValue);
   }
 
-  function getStatusRowValue(label: string, rawValue: unknown, status: ServerStatusResponse) {
-    if (label === 'API') {
-      return status.serverStatus;
+  function formatPercentValue(value: number | null | undefined) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return '-';
     }
 
-    if (label === 'Memory File') {
-      return getBooleanStatusText(rawValue, 'Found', 'Missing');
-    }
+    const roundedValue = Math.round(value);
 
-    if (label === 'Ollama') {
-      return getBooleanStatusText(rawValue, 'OK', 'Offline');
-    }
-
-    if (label === 'Version' && (rawValue === null || rawValue === undefined || rawValue === '')) {
-      return 'dev';
-    }
-
-    return formatStatusValue(rawValue);
+    return roundedValue + ' %';
   }
 
-  function getServiceLedStyle(label: string, value: string) {
+  function getUsageState(value: number | null | undefined): DashboardItemState {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return 'unknown';
+    }
+
+    if (value >= 90) {
+      return 'error';
+    }
+
+    if (value >= 80) {
+      return 'warning';
+    }
+
+    return 'ok';
+  }
+
+  function formatUpdateCount(count: number) {
+    if (count === 0) {
+      return 'OK';
+    }
+
+    return count === 1 ? '1 päivitys' : count + ' päivitystä';
+  }
+
+  function getDashboardStatusRows(dashboard: DashboardResponse): StatusRow[] {
+    const hubStatus = dashboard.hub?.status?.toLowerCase();
+    const workerOnline = dashboard.worker?.online;
+    const hubServiceStatus = dashboard.services?.seesam_hub?.toLowerCase();
+    const tailscaleStatus = dashboard.services?.tailscale?.toLowerCase();
+    const aptUpdateCount = dashboard.updates?.apt_updates_available_count ?? 0;
+    const firmwareUpdateCount = dashboard.updates?.firmware_updates_available_count ?? 0;
+    const updateCount = aptUpdateCount + firmwareUpdateCount;
+    const diskUsagePercent = dashboard.system?.disk_usage_percent;
+    const memoryUsagePercent = dashboard.system?.memory_usage_percent;
+
+    return [
+      {
+        label: 'Hub',
+        value: hubStatus === 'ok' ? 'Online' : hubStatus ? 'Offline' : 'Unknown',
+        state: hubStatus === 'ok' ? 'ok' : hubStatus ? 'error' : 'unknown',
+      },
+      {
+        label: 'Worker',
+        value: workerOnline === true ? 'Online' : workerOnline === false ? 'Offline' : 'Unknown',
+        state: workerOnline === true ? 'ok' : workerOnline === false ? 'offline' : 'unknown',
+      },
+      {
+        label: 'API',
+        value: hubServiceStatus === 'active' ? 'Active' : hubServiceStatus ? formatStatusValue(hubServiceStatus) : 'Unknown',
+        state: hubServiceStatus === 'active' ? 'ok' : 'error',
+      },
+      {
+        label: 'Tailscale',
+        value: tailscaleStatus === 'active' ? 'Online' : tailscaleStatus ? 'Offline' : 'Unknown',
+        state: tailscaleStatus === 'active' ? 'ok' : 'offline',
+      },
+      {
+        label: 'Päivitykset',
+        value: formatUpdateCount(updateCount),
+        state: updateCount === 0 ? 'ok' : 'warning',
+      },
+      {
+        label: 'Levy',
+        value: formatPercentValue(diskUsagePercent),
+        state: getUsageState(diskUsagePercent),
+      },
+      {
+        label: 'Muisti',
+        value: formatPercentValue(memoryUsagePercent),
+        state: getUsageState(memoryUsagePercent),
+      },
+    ];
+  }
+
+  function getServiceLedStyle(label: string, value: string, state?: DashboardItemState | string) {
+    const normalizedState = state?.toLowerCase();
+
+    if (normalizedState === 'ok') {
+      return styles.serviceLedGreen;
+    }
+
+    if (normalizedState === 'warning') {
+      return styles.serviceLedAmber;
+    }
+
+    if (normalizedState === 'error') {
+      return styles.serviceLedRed;
+    }
+
+    if (normalizedState === 'offline' || normalizedState === 'unknown') {
+      return styles.serviceLedGray;
+    }
+
     const normalizedLabel = label.toLowerCase();
     const normalizedValue = value.toLowerCase();
 
@@ -545,7 +622,7 @@ export default function HomeScreen() {
     }
 
     if (normalizedLabel === 'api') {
-      return normalizedValue === 'online' ? styles.serviceLedGreen : styles.serviceLedAmber;
+      return normalizedValue === 'online' || normalizedValue === 'active' ? styles.serviceLedGreen : styles.serviceLedAmber;
     }
 
     if (normalizedLabel === 'memory file') {
@@ -556,21 +633,11 @@ export default function HomeScreen() {
       return normalizedValue === 'ok' ? styles.serviceLedGreen : styles.serviceLedAmber;
     }
 
+    if (['hub', 'worker', 'tailscale'].includes(normalizedLabel)) {
+      return normalizedValue === 'online' ? styles.serviceLedGreen : styles.serviceLedAmber;
+    }
+
     return styles.serviceLedAmber;
-  }
-
-  function getServerStatusRows(status: ServerStatusResponse) {
-    return SERVICE_STATUS_FIELDS.map((field) => {
-      const rawValue =
-        field.label === 'API'
-          ? status.serverStatus
-          : findStatusValue(status.details, field.keys);
-
-      return {
-        label: field.label,
-        value: getStatusRowValue(field.label, rawValue, status),
-      };
-    });
   }
 
   async function refreshMaintenanceStatus() {
@@ -584,7 +651,7 @@ export default function HomeScreen() {
     }));
 
     try {
-      const serverStatus = await getServerStatus();
+      const dashboard = await getDashboard();
       const successfulConnectionAt = new Date().toLocaleString('fi-FI', {
         hour: '2-digit',
         minute: '2-digit',
@@ -598,10 +665,10 @@ export default function HomeScreen() {
       }
 
       setMaintenanceStatus({
-        detailRows: getServerStatusRows(serverStatus),
+        detailRows: getDashboardStatusRows(dashboard),
         error: null,
         loading: false,
-        status: serverStatus.serverStatus,
+        status: 'Online',
         updatedAt: successfulConnectionAt,
         lastSuccessfulConnectionAt: successfulConnectionAt,
       });
@@ -1160,7 +1227,7 @@ export default function HomeScreen() {
                   <View
                     style={[
                       styles.serviceLed,
-                      getServiceLedStyle(row.label, row.value),
+                      getServiceLedStyle(row.label, row.value, row.state),
                     ]}
                   />
                   <View style={styles.serviceTextGroup}>
@@ -1660,6 +1727,20 @@ const styles = StyleSheet.create({
     shadowColor: '#f0aa3c',
     shadowOffset: { height: 0, width: 0 },
     shadowOpacity: 0.55,
+    shadowRadius: 4,
+  },
+  serviceLedRed: {
+    backgroundColor: '#ff5a54',
+    shadowColor: '#ff5a54',
+    shadowOffset: { height: 0, width: 0 },
+    shadowOpacity: 0.6,
+    shadowRadius: 4,
+  },
+  serviceLedGray: {
+    backgroundColor: '#7f8588',
+    shadowColor: '#7f8588',
+    shadowOffset: { height: 0, width: 0 },
+    shadowOpacity: 0.45,
     shadowRadius: 4,
   },
   serviceTextGroup: {

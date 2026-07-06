@@ -1,6 +1,6 @@
 import Constants from 'expo-constants';
 
-const DEFAULT_PUBLIC_API_BASE_URL = 'http://192.168.68.75:8000';
+const DEFAULT_PUBLIC_API_BASE_URL = 'http://192.168.68.74:8000';
 
 
 type ExpoExtra = {
@@ -16,6 +16,45 @@ export type ChatResponse = {
 export type ServerStatusResponse = {
   serverStatus: string;
   details: Record<string, unknown>;
+};
+
+export type DashboardItemState = 'ok' | 'warning' | 'error' | 'offline' | 'unknown';
+
+export type DashboardResponse = {
+  hub?: {
+    status?: string;
+    hostname?: string;
+    time?: string;
+    uptime_seconds?: number | null;
+  };
+  worker?: {
+    host?: string;
+    online?: boolean;
+    last_used_at?: string | null;
+    idle_timeout_seconds?: number | null;
+    idle?: boolean;
+    seconds_since_last_used?: number | null;
+  };
+  system?: {
+    disk_usage_percent?: number | null;
+    memory_usage_percent?: number | null;
+    load_average?: {
+      '1m'?: number;
+      '5m'?: number;
+      '15m'?: number;
+    };
+  };
+  services?: {
+    seesam_hub?: string;
+    tailscale?: string;
+  };
+  updates?: {
+    apt_updates_available_count?: number | null;
+    apt_packages?: string[];
+    firmware_updates_available?: boolean;
+    firmware_updates_available_count?: number | null;
+    firmware_summaries?: string[];
+  };
 };
 
 export type SpeechAudioResponse = {
@@ -398,6 +437,23 @@ export async function getServerStatus(): Promise<ServerStatusResponse> {
     serverStatus: readServerStatus(payload),
     details: pickServerStatusDetails(payload),
   };
+}
+
+export async function getDashboard(): Promise<DashboardResponse> {
+  const response = await fetchFromSeesamApi(
+    'status',
+    '/dashboard',
+    () => ({
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+    }),
+    (response, errorBody) =>
+      ('Seesam dashboard request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
+  );
+
+  return response.json();
 }
 
 export async function getSpeechAudio(text: string): Promise<SpeechAudioResponse> {

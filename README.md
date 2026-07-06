@@ -34,7 +34,7 @@ The Seesam API must be running on port 8000. The app tries the LAN API first wit
 Copy [.env.example](./.env.example) to `.env` if you want to use your own addresses:
 
 ```sh
-EXPO_PUBLIC_SEESAM_LAN_API_URL=http://192.168.68.75:8000
+EXPO_PUBLIC_SEESAM_LAN_API_URL=http://192.168.68.74:8000
 EXPO_PUBLIC_SEESAM_TAILSCALE_API_URL=http://100.90.126.101:8000
 ```
 
