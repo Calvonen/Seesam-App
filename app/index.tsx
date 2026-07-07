@@ -51,6 +51,8 @@ type StatusRow = {
 type MaintenanceStatusState = {
   loading: boolean;
   status: string | null;
+  hubOnline: boolean | null;
+  workerOnline: boolean | null;
   detailRows: StatusRow[];
   error: string | null;
   updatedAt: string | null;
@@ -77,15 +79,18 @@ const STEP_ERROR_TEXT: Record<PushToTalkStep, string> = {
   speak: 'Puheen muodostus epäonnistui.',
   playback: 'Äänen toisto epäonnistui.',
 };
+const WORKER_OFFLINE_TEXT = 'Worker ei ole käynnissä.';
 
 
 const EMPTY_MAINTENANCE_STATUS: MaintenanceStatusState = {
   detailRows: [],
   error: null,
+  hubOnline: null,
   loading: false,
   status: null,
   updatedAt: null,
   lastSuccessfulConnectionAt: null,
+  workerOnline: null,
 };
 
 export default function HomeScreen() {
@@ -122,6 +127,7 @@ export default function HomeScreen() {
   const recordingStartedAt = useRef<number | null>(null);
   const recordingStopInProgress = useRef(false);
   const stopRecordingAfterStart = useRef(false);
+  const pushToTalkPressActive = useRef(false);
 
   useEffect(() => {
     void Audio.setAudioModeAsync({
@@ -553,10 +559,18 @@ export default function HomeScreen() {
     return count === 1 ? '1 päivitys' : count + ' päivitystä';
   }
 
+  function isDashboardHubOnline(dashboard: DashboardResponse) {
+    return dashboard.hub?.status?.toLowerCase() === 'ok';
+  }
+
+  function getDashboardWorkerOnline(dashboard: DashboardResponse) {
+    return typeof dashboard.worker?.online === 'boolean' ? dashboard.worker.online : null;
+  }
+
   function getDashboardStatusRows(dashboard: DashboardResponse): StatusRow[] {
     const hubStatus = dashboard.hub?.status?.toLowerCase();
-    const workerOnline = dashboard.worker?.online;
-    const hubServiceStatus = dashboard.services?.seesam_hub?.toLowerCase();
+    const hubOnline = isDashboardHubOnline(dashboard);
+    const workerOnline = getDashboardWorkerOnline(dashboard);
     const tailscaleStatus = dashboard.services?.tailscale?.toLowerCase();
     const aptUpdateCount = dashboard.updates?.apt_updates_available_count ?? 0;
     const firmwareUpdateCount = dashboard.updates?.firmware_updates_available_count ?? 0;
@@ -567,8 +581,8 @@ export default function HomeScreen() {
     return [
       {
         label: 'Hub',
-        value: hubStatus === 'ok' ? 'Online' : hubStatus ? 'Offline' : 'Unknown',
-        state: hubStatus === 'ok' ? 'ok' : hubStatus ? 'error' : 'unknown',
+        value: hubOnline ? 'Online' : hubStatus ? 'Offline' : 'Unknown',
+        state: hubOnline ? 'ok' : hubStatus ? 'error' : 'unknown',
       },
       {
         label: 'Worker',
@@ -577,8 +591,8 @@ export default function HomeScreen() {
       },
       {
         label: 'API',
-        value: hubServiceStatus === 'active' ? 'Active' : hubServiceStatus ? formatStatusValue(hubServiceStatus) : 'Unknown',
-        state: hubServiceStatus === 'active' ? 'ok' : 'error',
+        value: hubOnline ? 'Online' : hubStatus ? 'Offline' : 'Unknown',
+        state: hubOnline ? 'ok' : hubStatus ? 'error' : 'unknown',
       },
       {
         label: 'Tailscale',
@@ -677,11 +691,16 @@ export default function HomeScreen() {
         return;
       }
 
+      const hubOnline = isDashboardHubOnline(dashboard);
+      const workerOnline = getDashboardWorkerOnline(dashboard);
+
       setMaintenanceStatus({
         detailRows: getDashboardStatusRows(dashboard),
         error: null,
+        hubOnline,
         loading: false,
-        status: 'Online',
+        status: hubOnline ? 'Online' : 'Offline',
+        workerOnline,
         updatedAt: successfulConnectionAt,
         lastSuccessfulConnectionAt: successfulConnectionAt,
       });
@@ -695,8 +714,10 @@ export default function HomeScreen() {
           { label: 'API', value: 'Offline' },
         ],
         error: getErrorMessage(error),
+        hubOnline: false,
         loading: false,
         status: 'Offline',
+        workerOnline: null,
         updatedAt: currentStatus.updatedAt,
         lastSuccessfulConnectionAt: currentStatus.lastSuccessfulConnectionAt,
       }));
@@ -803,6 +824,51 @@ export default function HomeScreen() {
   function showAnswer(answer: string) {
     setAnswerText(answer);
     setErrorDetailText(null);
+  }
+
+  function showWorkerOffline() {
+    setAnswerText(WORKER_OFFLINE_TEXT);
+    setErrorDetailText(null);
+    returnToIdle();
+  }
+
+  async function canUseWorker() {
+    try {
+      const dashboard = await getDashboard();
+      const hubOnline = isDashboardHubOnline(dashboard);
+      const workerOnline = getDashboardWorkerOnline(dashboard);
+
+      setMaintenanceStatus((currentStatus) => ({
+        ...currentStatus,
+        detailRows: getDashboardStatusRows(dashboard),
+        error: null,
+        hubOnline,
+        loading: false,
+        status: hubOnline ? 'Online' : 'Offline',
+        workerOnline,
+      }));
+
+      if (workerOnline === false) {
+        showWorkerOffline();
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      setMaintenanceStatus((currentStatus) => ({
+        ...currentStatus,
+        detailRows: [
+          { label: 'API', value: 'Offline' },
+        ],
+        error: getErrorMessage(error),
+        hubOnline: false,
+        loading: false,
+        status: 'Offline',
+        workerOnline: null,
+      }));
+
+      throw error;
+    }
   }
 
   function isPushToTalkStep(step: SeesamRequestError['step']): step is Extract<PushToTalkStep, SeesamRequestError['step']> {
@@ -1041,6 +1107,21 @@ export default function HomeScreen() {
       return;
     }
 
+    try {
+      const workerAvailable = await canUseWorker();
+
+      if (!workerAvailable) {
+        return;
+      }
+    } catch (error) {
+      showStepFailure('chat', error);
+      return;
+    }
+
+    if (!pushToTalkPressActive.current) {
+      return;
+    }
+
     const requestId = activeRequestId.current + 1;
     recordingRequestId.current = requestId;
     recordingStartInProgress.current = true;
@@ -1165,10 +1246,21 @@ export default function HomeScreen() {
     }
   }
 
-  function sendMessage() {
+  async function sendMessage() {
     const chatMessage = questionText.trim();
 
     if (!chatMessage) {
+      return;
+    }
+
+    try {
+      const workerAvailable = await canUseWorker();
+
+      if (!workerAvailable) {
+        return;
+      }
+    } catch (error) {
+      showStepFailure('chat', error);
       return;
     }
 
@@ -1516,10 +1608,11 @@ export default function HomeScreen() {
                 pressButton();
 
                 if (textMode) {
-                  sendMessage();
+                  void sendMessage();
                   return;
                 }
 
+                pushToTalkPressActive.current = true;
                 void startPushToTalk();
               }}
               onPressOut={() => {
@@ -1529,6 +1622,7 @@ export default function HomeScreen() {
                   return;
                 }
 
+                pushToTalkPressActive.current = false;
                 void stopPushToTalk();
               }}
               style={({ pressed }) => [
