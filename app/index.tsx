@@ -20,7 +20,9 @@ import {
   getDashboard,
   getSpeechAudio,
   sendChatMessage,
+  shutdownWorker,
   transcribeAudio,
+  wakeWorker,
   SeesamRequestError,
   type DashboardItemState,
   type DashboardResponse,
@@ -56,6 +58,8 @@ type MaintenanceStatusState = {
 };
 
 type PushToTalkStep = 'recording' | 'transcribe' | 'chat' | 'speak' | 'playback';
+type WorkerActionState = 'idle' | 'waking' | 'shutting-down';
+type ServiceConsoleTab = 'connections' | 'system' | 'controls';
 
 const STATUS_TEXT: Record<IntercomState, string> = {
   idle: 'Valmiina',
@@ -90,9 +94,13 @@ export default function HomeScreen() {
   const [maintenanceMode, setMaintenanceMode] = useState(false);
   const [maintenanceStatus, setMaintenanceStatus] =
     useState<MaintenanceStatusState>(EMPTY_MAINTENANCE_STATUS);
+  const [workerActionState, setWorkerActionState] =
+    useState<WorkerActionState>('idle');
   const [errorDetailText, setErrorDetailText] = useState<string | null>(null);
   const [questionText, setQuestionText] = useState('');
   const [textMode, setTextMode] = useState(false);
+  const [serviceConsoleTab, setServiceConsoleTab] =
+    useState<ServiceConsoleTab>('connections');
   const staticOpacity = useRef(new Animated.Value(0)).current;
   const blueGlow = useRef(new Animated.Value(0)).current;
   const amberGlow = useRef(new Animated.Value(0)).current;
@@ -652,13 +660,18 @@ export default function HomeScreen() {
 
     try {
       const dashboard = await getDashboard();
-      const successfulConnectionAt = new Date().toLocaleString('fi-FI', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        day: '2-digit',
-        month: '2-digit',
-      });
+      const successfulConnectionDate = new Date();
+      const successfulConnectionAt =
+        successfulConnectionDate.toLocaleDateString('fi-FI', {
+          day: '2-digit',
+          month: '2-digit',
+        }) +
+        ' klo ' +
+        successfulConnectionDate.toLocaleTimeString('fi-FI', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        });
 
       if (statusRequestId.current !== requestId) {
         return;
@@ -687,6 +700,46 @@ export default function HomeScreen() {
         updatedAt: currentStatus.updatedAt,
         lastSuccessfulConnectionAt: currentStatus.lastSuccessfulConnectionAt,
       }));
+    }
+  }
+
+  async function handleWakeWorker() {
+    if (workerActionState !== 'idle') {
+      return;
+    }
+
+    setWorkerActionState('waking');
+
+    try {
+      await wakeWorker();
+      await refreshMaintenanceStatus();
+    } catch (error) {
+      setMaintenanceStatus((currentStatus) => ({
+        ...currentStatus,
+        error: getErrorMessage(error),
+      }));
+    } finally {
+      setWorkerActionState('idle');
+    }
+  }
+
+  async function handleShutdownWorker() {
+    if (workerActionState !== 'idle') {
+      return;
+    }
+
+    setWorkerActionState('shutting-down');
+
+    try {
+      await shutdownWorker();
+      await refreshMaintenanceStatus();
+    } catch (error) {
+      setMaintenanceStatus((currentStatus) => ({
+        ...currentStatus,
+        error: getErrorMessage(error),
+      }));
+    } finally {
+      setWorkerActionState('idle');
     }
   }
 
@@ -752,12 +805,16 @@ export default function HomeScreen() {
     setErrorDetailText(null);
   }
 
+  function isPushToTalkStep(step: SeesamRequestError['step']): step is Extract<PushToTalkStep, SeesamRequestError['step']> {
+    return step === 'transcribe' || step === 'chat' || step === 'speak';
+  }
+
   function getStepFailureDetails(
     step: PushToTalkStep,
     error: unknown,
     fallbackRequestUrl = 'local',
   ): { originalError: unknown; requestUrl: string; step: PushToTalkStep } {
-    if (error instanceof SeesamRequestError && error.step !== 'status') {
+    if (error instanceof SeesamRequestError && isPushToTalkStep(error.step)) {
       return {
         originalError: error.originalError,
         requestUrl: error.requestUrl,
@@ -1121,6 +1178,136 @@ export default function HomeScreen() {
     void askSeesam(chatMessage, requestId);
   }
 
+  function renderServiceStatusRows(labels: string[]) {
+    return maintenanceStatus.detailRows
+      .filter((row) => labels.includes(row.label))
+      .map((row) => (
+        <View key={row.label} style={styles.serviceLine}>
+          <View
+            style={[
+              styles.serviceLed,
+              getServiceLedStyle(row.label, row.value, row.state),
+            ]}
+          />
+          <View style={styles.serviceTextGroup}>
+            <Text style={styles.serviceLabel}>{row.label}</Text>
+            <Text numberOfLines={1} style={styles.serviceValue}>{row.value}</Text>
+          </View>
+        </View>
+      ));
+  }
+
+  function renderServiceSection(title: string, labels: string[]) {
+    const rows = renderServiceStatusRows(labels);
+
+    if (rows.length === 0) {
+      return null;
+    }
+
+    return (
+      <View style={styles.serviceSection}>
+        <Text style={styles.serviceSectionTitle}>{title}</Text>
+        {rows}
+      </View>
+    );
+  }
+
+  function renderServiceControls() {
+    const workerActionInProgress = workerActionState !== 'idle';
+    const serviceControlDisabled = workerActionInProgress || maintenanceStatus.loading;
+
+    return (
+      <View style={styles.serviceSection}>
+        <Text style={styles.serviceSectionTitle}>OHJAUS</Text>
+        <View style={styles.serviceControls}>
+          <Pressable
+            accessibilityLabel="Käynnistä Worker"
+            disabled={serviceControlDisabled}
+            onPress={() => {
+              void handleWakeWorker();
+            }}
+            style={[
+              styles.serviceControlButton,
+              serviceControlDisabled && styles.serviceControlButtonDisabled,
+            ]}
+          >
+            <Text style={styles.serviceControlButtonText}>
+              {workerActionState === 'waking' ? 'Käynnistetään...' : '▶ Käynnistä Worker'}
+            </Text>
+          </Pressable>
+          <Pressable
+            accessibilityLabel="Sammuta Worker"
+            disabled={serviceControlDisabled}
+            onPress={() => {
+              void handleShutdownWorker();
+            }}
+            style={[
+              styles.serviceControlButton,
+              styles.serviceControlButtonStop,
+              serviceControlDisabled && styles.serviceControlButtonDisabled,
+            ]}
+          >
+            <Text style={styles.serviceControlButtonText}>
+              {workerActionState === 'shutting-down' ? 'Sammutetaan...' : '■ Sammuta Worker'}
+            </Text>
+          </Pressable>
+          <Pressable
+            accessibilityLabel="Päivitä tila"
+            disabled={serviceControlDisabled}
+            onPress={() => {
+              void refreshMaintenanceStatus();
+            }}
+            style={[
+              styles.serviceControlButton,
+              serviceControlDisabled && styles.serviceControlButtonDisabled,
+            ]}
+          >
+            <Text style={styles.serviceControlButtonText}>↻ Päivitä tila</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
+
+  function renderServiceConsoleTabButton(tab: ServiceConsoleTab, label: string) {
+    const isActive = serviceConsoleTab === tab;
+
+    return (
+      <Pressable
+        accessibilityRole="tab"
+        accessibilityState={{ selected: isActive }}
+        onPress={() => {
+          setServiceConsoleTab(tab);
+        }}
+        style={[
+          styles.serviceTabButton,
+          isActive && styles.serviceTabButtonActive,
+        ]}
+      >
+        <Text
+          style={[
+            styles.serviceTabButtonText,
+            isActive && styles.serviceTabButtonTextActive,
+          ]}
+        >
+          {label}
+        </Text>
+      </Pressable>
+    );
+  }
+
+  function renderServiceConsoleActiveTab() {
+    if (serviceConsoleTab === 'system') {
+      return renderServiceSection("JÄRJESTELMÄ", ["Päivitykset", "Levy", "Muisti"]);
+    }
+
+    if (serviceConsoleTab === 'controls') {
+      return renderServiceControls();
+    }
+
+    return renderServiceSection("YHTEYDET", ["Hub", "Worker", "API", "Tailscale"]);
+  }
+
   return (
     <TouchableWithoutFeedback accessible={false} onPress={Keyboard.dismiss}>
       <View style={styles.screen}>
@@ -1193,22 +1380,23 @@ export default function HomeScreen() {
               />
             </View>
           </Pressable>
-          <View style={styles.serviceStatusList}>
+          <View style={styles.serviceConsoleBody}>
             {maintenanceStatus.lastSuccessfulConnectionAt ? (
-              <View style={styles.serviceLine}>
-                <View style={[styles.serviceLed, styles.serviceLedAmber]} />
-                <View style={styles.serviceTextGroup}>
-                  <Text style={styles.serviceLabel}>LAST OK</Text>
-                  <Text style={styles.serviceValue}>{maintenanceStatus.lastSuccessfulConnectionAt}</Text>
-                </View>
-              </View>
+              <Text style={styles.serviceUpdatedAt}>
+                Päivitetty: {maintenanceStatus.lastSuccessfulConnectionAt}
+              </Text>
             ) : null}
+            <View style={styles.serviceTabs}>
+              {renderServiceConsoleTabButton('connections', 'YHTEYDET')}
+              {renderServiceConsoleTabButton('system', 'JÄRJESTELMÄ')}
+              {renderServiceConsoleTabButton('controls', 'OHJAUS')}
+            </View>
             {maintenanceStatus.error ? (
               <View style={styles.serviceLine}>
                 <View style={[styles.serviceLed, styles.serviceLedAmber]} />
                 <View style={styles.serviceTextGroup}>
                   <Text style={styles.serviceLabel}>STATUS</Text>
-                  <Text style={styles.serviceValue}>{maintenanceStatus.error}</Text>
+                  <Text numberOfLines={1} style={styles.serviceValue}>{maintenanceStatus.error}</Text>
                 </View>
               </View>
             ) : null}
@@ -1221,22 +1409,8 @@ export default function HomeScreen() {
                   <Text style={styles.serviceValue}>SYNCING...</Text>
                 </View>
               </View>
-            ) : (
-              maintenanceStatus.detailRows.map((row) => (
-                <View key={row.label} style={styles.serviceLine}>
-                  <View
-                    style={[
-                      styles.serviceLed,
-                      getServiceLedStyle(row.label, row.value, row.state),
-                    ]}
-                  />
-                  <View style={styles.serviceTextGroup}>
-                    <Text style={styles.serviceLabel}>{row.label}</Text>
-                    <Text style={styles.serviceValue}>{row.value}</Text>
-                  </View>
-                </View>
-              ))
-            )}
+            ) : null}
+            {renderServiceConsoleActiveTab()}
           </View>
         </Animated.View>
 
@@ -1595,9 +1769,9 @@ const styles = StyleSheet.create({
     borderWidth: 3,
     bottom: 116,
     left: 18,
-    paddingHorizontal: 16,
-    paddingTop: 16,
-    paddingBottom: 14,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 12,
     position: 'absolute',
     right: 18,
     shadowColor: '#000000',
@@ -1696,23 +1870,71 @@ const styles = StyleSheet.create({
     shadowColor: '#8df58c',
     transform: [{ translateX: 18 }],
   },
-  serviceStatusList: {
-    height: 270,
-    maxHeight: 270,
+  serviceConsoleBody: {
+    flex: 1,
     minHeight: 0,
   },
+  serviceTabs: {
+    flexDirection: 'row',
+    gap: 5,
+    marginBottom: 6,
+  },
+  serviceTabButton: {
+    alignItems: 'center',
+    borderColor: 'rgba(141, 245, 140, 0.26)',
+    borderRadius: 5,
+    borderWidth: 1,
+    flex: 1,
+    height: 26,
+    justifyContent: 'center',
+    paddingHorizontal: 4,
+  },
+  serviceTabButtonActive: {
+    backgroundColor: 'rgba(141, 245, 140, 0.12)',
+    borderColor: 'rgba(141, 245, 140, 0.68)',
+  },
+  serviceTabButtonText: {
+    color: '#7f8588',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 8,
+    fontWeight: '900',
+    letterSpacing: 0,
+  },
+  serviceTabButtonTextActive: {
+    color: '#8df58c',
+  },
+  serviceUpdatedAt: {
+    color: '#7f8588',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 9,
+    fontWeight: '700',
+    letterSpacing: 0,
+    marginBottom: 5,
+  },
+  serviceSection: {
+    marginTop: 4,
+  },
+  serviceSectionTitle: {
+    color: '#f0aa3c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0,
+    marginBottom: 2,
+    textTransform: 'uppercase',
+  },
   serviceLine: {
-    alignItems: 'flex-start',
+    alignItems: 'center',
     borderTopColor: 'rgba(141, 245, 140, 0.12)',
     borderTopWidth: 1,
     flexDirection: 'row',
-    paddingVertical: 4,
+    minHeight: 22,
+    paddingVertical: 2,
   },
   serviceLed: {
     borderRadius: 4,
     height: 8,
     marginRight: 7,
-    marginTop: 4,
     width: 8,
   },
   serviceLedGreen: {
@@ -1744,21 +1966,53 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
   },
   serviceTextGroup: {
+    alignItems: 'center',
     flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
   },
   serviceLabel: {
     color: '#f0aa3c',
+    flexShrink: 0,
     fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
     fontSize: 10,
     fontWeight: '800',
     letterSpacing: 0,
+    paddingRight: 10,
     textTransform: 'uppercase',
   },
   serviceValue: {
     color: '#8df58c',
+    flexShrink: 1,
     fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
     fontSize: 10,
     fontWeight: '700',
+    letterSpacing: 0,
+    textAlign: 'right',
+  },
+  serviceControls: {
+    gap: 5,
+  },
+  serviceControlButton: {
+    alignItems: 'center',
+    borderColor: 'rgba(141, 245, 140, 0.42)',
+    borderRadius: 5,
+    borderWidth: 1,
+    height: 25,
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  serviceControlButtonStop: {
+    borderColor: 'rgba(240, 170, 60, 0.48)',
+  },
+  serviceControlButtonDisabled: {
+    opacity: 0.55,
+  },
+  serviceControlButtonText: {
+    color: '#8df58c',
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' }),
+    fontSize: 9,
+    fontWeight: '800',
     letterSpacing: 0,
   },
   grilleBar: {

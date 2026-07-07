@@ -65,7 +65,7 @@ export type TranscribeResponse = {
   text: string;
 };
 
-export type SeesamRequestStep = 'transcribe' | 'chat' | 'speak' | 'status';
+export type SeesamRequestStep = 'transcribe' | 'chat' | 'speak' | 'status' | 'intent';
 
 export class SeesamRequestError extends Error {
   originalError: unknown;
@@ -456,6 +456,36 @@ export async function getDashboard(): Promise<DashboardResponse> {
   return response.json();
 }
 
+export async function wakeWorker(): Promise<void> {
+  await fetchFromSeesamApi(
+    'status',
+    '/worker/wake',
+    () => ({
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+      },
+    }),
+    (response, errorBody) =>
+      ('Worker wake request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
+  );
+}
+
+export async function shutdownWorker(): Promise<void> {
+  await fetchFromSeesamApi(
+    'status',
+    '/worker/shutdown',
+    () => ({
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+      },
+    }),
+    (response, errorBody) =>
+      ('Worker shutdown request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
+  );
+}
+
 export async function getSpeechAudio(text: string): Promise<SpeechAudioResponse> {
   const response = await fetchFromSeesamApi(
     'speak',
@@ -509,6 +539,31 @@ export async function transcribeAudio(audioUri: string): Promise<TranscribeRespo
   return {
     text: transcribedText,
   };
+}
+
+async function sendIntent(text: string): Promise<void> {
+  await fetchFromSeesamApi(
+    'intent',
+    '/intent',
+    () => ({
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+    }),
+    (response, errorBody) =>
+      ('Seesam intent request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
+  );
+}
+
+export async function startWorker(): Promise<void> {
+  await sendIntent('käynnistä worker');
+}
+
+export async function stopWorker(): Promise<void> {
+  await sendIntent('sammuta worker');
 }
 
 export async function sendChatMessage(message: string): Promise<ChatResponse> {
