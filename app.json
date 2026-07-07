@@ -19,7 +19,11 @@
     "extra": {
       "lanApiBaseUrl": "http://192.168.68.74:8000",
       "publicApiBaseUrl": "http://100.90.126.101:8000",
-      "tailscaleApiBaseUrl": "http://100.90.126.101:8000"
+      "tailscaleApiBaseUrl": "http://100.90.126.101:8000",
+      "router": {},
+      "eas": {
+        "projectId": "5f65bd30-ad48-45b9-b8b9-c808df65f72c"
+      }
     },
     "experiments": {
       "typedRoutes": true
