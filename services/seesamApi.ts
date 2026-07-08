@@ -1,11 +1,13 @@
 import Constants from 'expo-constants';
 
-const DEFAULT_PUBLIC_API_BASE_URL = 'http://192.168.68.74:8000';
+const FALLBACK_SOFT_TIMEOUT_MS = 3000;
+const DEFAULT_PUBLIC_API_BASE_URL = 'http://100.95.239.27:8000';
 
 
 type ExpoExtra = {
   lanApiBaseUrl?: string;
   publicApiBaseUrl?: string;
+  tailscaleApiBaseUrl?: string;
   seesamApiBaseUrl?: string;
 };
 
@@ -73,7 +75,7 @@ export class SeesamRequestError extends Error {
   step: SeesamRequestStep;
 
   constructor(step: SeesamRequestStep, requestUrl: string, originalError: unknown) {
-    super(getErrorMessage(originalError));
+    super(getErrorMessage(originalError) + ' Request URL: ' + requestUrl);
     this.name = 'SeesamRequestError';
     this.originalError = originalError;
     this.requestUrl = requestUrl;
@@ -113,6 +115,7 @@ function getApiBaseUrls() {
   const lanBaseUrl = normalizeApiBaseUrl(extra.lanApiBaseUrl);
   const publicBaseUrl =
     normalizeApiBaseUrl(extra.publicApiBaseUrl) ??
+    normalizeApiBaseUrl(extra.tailscaleApiBaseUrl) ??
     normalizeApiBaseUrl(extra.seesamApiBaseUrl) ??
     DEFAULT_PUBLIC_API_BASE_URL;
   const apiBaseUrls = lanBaseUrl ? [lanBaseUrl, publicBaseUrl] : [publicBaseUrl];
@@ -122,6 +125,17 @@ function getApiBaseUrls() {
 
 function buildRequestUrl(baseUrl: string, path: string) {
   return baseUrl + path;
+}
+
+function fetchWithSoftTimeout(requestUrl: string, requestInit: RequestInit) {
+  return Promise.race([
+    fetch(requestUrl, requestInit),
+    new Promise<Response>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error('Seesam API request timed out before trying fallback.'));
+      }, FALLBACK_SOFT_TIMEOUT_MS);
+    }),
+  ]);
 }
 
 async function fetchFromSeesamApi(
@@ -136,9 +150,13 @@ async function fetchFromSeesamApi(
   for (const [index, baseUrl] of apiBaseUrls.entries()) {
     const requestUrl = buildRequestUrl(baseUrl, path);
     lastRequestUrl = requestUrl;
+    const hasFallbackUrl = index < apiBaseUrls.length - 1;
 
     try {
-      const response = await fetch(requestUrl, requestInit());
+      const init = requestInit();
+      const response = hasFallbackUrl
+        ? await fetchWithSoftTimeout(requestUrl, init)
+        : await fetch(requestUrl, init);
 
       if (!response.ok) {
         const errorBody = await readErrorBody(response);
@@ -147,8 +165,6 @@ async function fetchFromSeesamApi(
 
       return response;
     } catch (error) {
-      const hasFallbackUrl = index < apiBaseUrls.length - 1;
-
       if (hasFallbackUrl) {
         continue;
       }
