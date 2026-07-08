@@ -70,14 +70,6 @@ export type TranscribeResponse = {
 
 export type SeesamRequestStep = 'transcribe' | 'chat' | 'speak' | 'status' | 'intent';
 
-type FetchFromSeesamApiOptions = {
-  refreshBaseUrl?: boolean;
-};
-
-export type GetDashboardOptions = {
-  refreshBaseUrl?: boolean;
-};
-
 export class SeesamRequestError extends Error {
   originalError: unknown;
   requestUrl: string;
@@ -183,22 +175,19 @@ async function probeApiBaseUrl(baseUrl: string) {
   }
 }
 
-async function resolveApiBaseUrl(
-  options: FetchFromSeesamApiOptions & { ignoredBaseUrls?: string[] } = {},
-) {
-  const ignoredBaseUrlSet = new Set(options.ignoredBaseUrls ?? []);
-  const shouldRefreshBaseUrl = options.refreshBaseUrl === true;
+async function resolveApiBaseUrl(ignoredBaseUrls: string[] = []) {
+  const ignoredBaseUrlSet = new Set(ignoredBaseUrls);
 
-  if (!shouldRefreshBaseUrl && ignoredBaseUrlSet.size === 0 && cachedApiBaseUrl) {
+  if (ignoredBaseUrlSet.size === 0 && cachedApiBaseUrl) {
     return cachedApiBaseUrl;
   }
 
-  if (!shouldRefreshBaseUrl && ignoredBaseUrlSet.size === 0 && pendingApiBaseUrlResolution) {
+  if (ignoredBaseUrlSet.size === 0 && pendingApiBaseUrlResolution) {
     return pendingApiBaseUrlResolution;
   }
 
   const resolution = (async () => {
-    const apiBaseUrls = getApiBaseUrls(shouldRefreshBaseUrl ? null : cachedApiBaseUrl).filter((baseUrl) => !ignoredBaseUrlSet.has(baseUrl));
+    const apiBaseUrls = getApiBaseUrls(cachedApiBaseUrl).filter((baseUrl) => !ignoredBaseUrlSet.has(baseUrl));
     let lastRequestUrl = buildRequestUrl(apiBaseUrls[0] ?? DEFAULT_PUBLIC_API_BASE_URL, API_BASE_URL_PROBE_PATH);
     let lastError: unknown = new Error('No Seesam API base URLs are configured.');
 
@@ -218,7 +207,7 @@ async function resolveApiBaseUrl(
     throw wrapRequestError('status', lastRequestUrl, lastError);
   })();
 
-  if (!shouldRefreshBaseUrl && ignoredBaseUrlSet.size === 0) {
+  if (ignoredBaseUrlSet.size === 0) {
     pendingApiBaseUrlResolution = resolution;
     resolution.then(
       () => {
@@ -259,9 +248,8 @@ async function fetchFromSeesamApi(
   path: string,
   requestInit: () => RequestInit,
   buildHttpError: (response: Response, errorBody: string) => string,
-  options: FetchFromSeesamApiOptions = {},
 ) {
-  const baseUrl = await resolveApiBaseUrl(options);
+  const baseUrl = await resolveApiBaseUrl();
   const requestUrl = buildRequestUrl(baseUrl, path);
 
   try {
@@ -276,7 +264,7 @@ async function fetchFromSeesamApi(
     }
 
     try {
-      const fallbackBaseUrl = await resolveApiBaseUrl({ ignoredBaseUrls: [baseUrl] });
+      const fallbackBaseUrl = await resolveApiBaseUrl([baseUrl]);
       return await sendSeesamRequest(fallbackBaseUrl, path, requestInit, buildHttpError);
     } catch (fallbackError) {
       throw wrapRequestError(step, requestUrl, fallbackError);
@@ -563,7 +551,7 @@ export async function getServerStatus(): Promise<ServerStatusResponse> {
   };
 }
 
-export async function getDashboard(options: GetDashboardOptions = {}): Promise<DashboardResponse> {
+export async function getDashboard(): Promise<DashboardResponse> {
   const response = await fetchFromSeesamApi(
     'status',
     '/dashboard',
@@ -575,7 +563,6 @@ export async function getDashboard(options: GetDashboardOptions = {}): Promise<D
     }),
     (response, errorBody) =>
       ('Seesam dashboard request failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
-    options,
   );
 
   return response.json();
