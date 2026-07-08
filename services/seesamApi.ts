@@ -1,14 +1,11 @@
 import Constants from 'expo-constants';
 
 const DEFAULT_PUBLIC_API_BASE_URL = 'http://192.168.68.74:8000';
-const API_BASE_URL_PROBE_TIMEOUT_MS = 2500;
-const API_BASE_URL_PROBE_PATH = '/dashboard';
 
 
 type ExpoExtra = {
   lanApiBaseUrl?: string;
   publicApiBaseUrl?: string;
-  tailscaleApiBaseUrl?: string;
   seesamApiBaseUrl?: string;
 };
 
@@ -84,8 +81,6 @@ export class SeesamRequestError extends Error {
   }
 }
 
-class SeesamHttpResponseError extends Error {}
-
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
     return error.message;
@@ -103,8 +98,6 @@ function wrapRequestError(step: SeesamRequestStep, requestUrl: string, error: un
 }
 
 const extra = (Constants.expoConfig?.extra ?? {}) as ExpoExtra;
-let cachedApiBaseUrl: string | null = null;
-let pendingApiBaseUrlResolution: Promise<string> | null = null;
 
 function normalizeApiBaseUrl(baseUrl: string | undefined) {
   const trimmedBaseUrl = baseUrl?.trim();
@@ -116,131 +109,19 @@ function normalizeApiBaseUrl(baseUrl: string | undefined) {
   return trimmedBaseUrl.replace(/\/+$/, '');
 }
 
-function uniqueValues(values: string[]) {
-  return Array.from(new Set(values));
-}
-
-function getApiBaseUrls(preferredBaseUrl?: string | null) {
+function getApiBaseUrls() {
   const lanBaseUrl = normalizeApiBaseUrl(extra.lanApiBaseUrl);
-  const publicBaseUrls = [
-    normalizeApiBaseUrl(extra.publicApiBaseUrl),
-    normalizeApiBaseUrl(extra.tailscaleApiBaseUrl),
-    normalizeApiBaseUrl(extra.seesamApiBaseUrl),
-    DEFAULT_PUBLIC_API_BASE_URL,
-  ].filter((baseUrl): baseUrl is string => Boolean(baseUrl));
-  const apiBaseUrls = lanBaseUrl ? [lanBaseUrl, ...publicBaseUrls] : publicBaseUrls;
-  const preferredApiBaseUrl = normalizeApiBaseUrl(preferredBaseUrl ?? undefined);
+  const publicBaseUrl =
+    normalizeApiBaseUrl(extra.publicApiBaseUrl) ??
+    normalizeApiBaseUrl(extra.seesamApiBaseUrl) ??
+    DEFAULT_PUBLIC_API_BASE_URL;
+  const apiBaseUrls = lanBaseUrl ? [lanBaseUrl, publicBaseUrl] : [publicBaseUrl];
 
-  return uniqueValues(preferredApiBaseUrl ? [preferredApiBaseUrl, ...apiBaseUrls] : apiBaseUrls);
+  return Array.from(new Set(apiBaseUrls));
 }
 
 function buildRequestUrl(baseUrl: string, path: string) {
   return baseUrl + path;
-}
-
-async function fetchWithTimeout(requestUrl: string, requestInit: RequestInit, timeoutMs: number) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => {
-    controller.abort();
-  }, timeoutMs);
-
-  try {
-    return await fetch(requestUrl, {
-      ...requestInit,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function probeApiBaseUrl(baseUrl: string) {
-  const requestUrl = buildRequestUrl(baseUrl, API_BASE_URL_PROBE_PATH);
-  const response = await fetchWithTimeout(
-    requestUrl,
-    {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-      },
-    },
-    API_BASE_URL_PROBE_TIMEOUT_MS,
-  );
-
-  if (!response.ok) {
-    const errorBody = await readErrorBody(response);
-    throw new SeesamHttpResponseError(
-      ('Seesam dashboard probe failed with ' + response.status + ' ' + response.statusText + '. ' + errorBody).trim(),
-    );
-  }
-}
-
-async function resolveApiBaseUrl(ignoredBaseUrls: string[] = []) {
-  const ignoredBaseUrlSet = new Set(ignoredBaseUrls);
-
-  if (ignoredBaseUrlSet.size === 0 && cachedApiBaseUrl) {
-    return cachedApiBaseUrl;
-  }
-
-  if (ignoredBaseUrlSet.size === 0 && pendingApiBaseUrlResolution) {
-    return pendingApiBaseUrlResolution;
-  }
-
-  const resolution = (async () => {
-    const apiBaseUrls = getApiBaseUrls(cachedApiBaseUrl).filter((baseUrl) => !ignoredBaseUrlSet.has(baseUrl));
-    let lastRequestUrl = buildRequestUrl(apiBaseUrls[0] ?? DEFAULT_PUBLIC_API_BASE_URL, API_BASE_URL_PROBE_PATH);
-    let lastError: unknown = new Error('No Seesam API base URLs are configured.');
-
-    for (const baseUrl of apiBaseUrls) {
-      const requestUrl = buildRequestUrl(baseUrl, API_BASE_URL_PROBE_PATH);
-      lastRequestUrl = requestUrl;
-
-      try {
-        await probeApiBaseUrl(baseUrl);
-        cachedApiBaseUrl = baseUrl;
-        return baseUrl;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
-    throw wrapRequestError('status', lastRequestUrl, lastError);
-  })();
-
-  if (ignoredBaseUrlSet.size === 0) {
-    pendingApiBaseUrlResolution = resolution;
-    resolution.then(
-      () => {
-        if (pendingApiBaseUrlResolution === resolution) {
-          pendingApiBaseUrlResolution = null;
-        }
-      },
-      () => {
-        if (pendingApiBaseUrlResolution === resolution) {
-          pendingApiBaseUrlResolution = null;
-        }
-      },
-    );
-  }
-
-  return resolution;
-}
-
-async function sendSeesamRequest(
-  baseUrl: string,
-  path: string,
-  requestInit: () => RequestInit,
-  buildHttpError: (response: Response, errorBody: string) => string,
-) {
-  const requestUrl = buildRequestUrl(baseUrl, path);
-  const response = await fetch(requestUrl, requestInit());
-
-  if (!response.ok) {
-    const errorBody = await readErrorBody(response);
-    throw new SeesamHttpResponseError(buildHttpError(response, errorBody));
-  }
-
-  return response;
 }
 
 async function fetchFromSeesamApi(
@@ -249,27 +130,34 @@ async function fetchFromSeesamApi(
   requestInit: () => RequestInit,
   buildHttpError: (response: Response, errorBody: string) => string,
 ) {
-  const baseUrl = await resolveApiBaseUrl();
-  const requestUrl = buildRequestUrl(baseUrl, path);
+  const apiBaseUrls = getApiBaseUrls();
+  let lastRequestUrl = buildRequestUrl(apiBaseUrls[0], path);
 
-  try {
-    return await sendSeesamRequest(baseUrl, path, requestInit, buildHttpError);
-  } catch (error) {
-    if (error instanceof SeesamHttpResponseError) {
-      throw wrapRequestError(step, requestUrl, error);
-    }
-
-    if (cachedApiBaseUrl === baseUrl) {
-      cachedApiBaseUrl = null;
-    }
+  for (const [index, baseUrl] of apiBaseUrls.entries()) {
+    const requestUrl = buildRequestUrl(baseUrl, path);
+    lastRequestUrl = requestUrl;
 
     try {
-      const fallbackBaseUrl = await resolveApiBaseUrl([baseUrl]);
-      return await sendSeesamRequest(fallbackBaseUrl, path, requestInit, buildHttpError);
-    } catch (fallbackError) {
-      throw wrapRequestError(step, requestUrl, fallbackError);
+      const response = await fetch(requestUrl, requestInit());
+
+      if (!response.ok) {
+        const errorBody = await readErrorBody(response);
+        throw new Error(buildHttpError(response, errorBody));
+      }
+
+      return response;
+    } catch (error) {
+      const hasFallbackUrl = index < apiBaseUrls.length - 1;
+
+      if (hasFallbackUrl) {
+        continue;
+      }
+
+      throw wrapRequestError(step, lastRequestUrl, error);
     }
   }
+
+  throw wrapRequestError(step, lastRequestUrl, new Error('Seesam API request failed.'));
 }
 
 function readAnswer(payload: unknown) {
