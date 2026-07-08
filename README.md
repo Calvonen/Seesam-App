@@ -35,7 +35,7 @@ Copy [.env.example](./.env.example) to `.env` if you want to use your own addres
 
 ```sh
 EXPO_PUBLIC_SEESAM_LAN_API_URL=http://192.168.68.74:8000
-EXPO_PUBLIC_SEESAM_TAILSCALE_API_URL=http://100.90.126.101:8000
+EXPO_PUBLIC_SEESAM_TAILSCALE_API_URL=http://100.95.239.27:8000
 ```
 
 At home, the app uses the LAN address without requiring Tailscale on the phone. Outside home, keep Tailscale enabled on the phone so the app can reach the Tailscale address.
