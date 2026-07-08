@@ -662,7 +662,7 @@ export default function HomeScreen() {
     return styles.serviceLedAmber;
   }
 
-  async function refreshMaintenanceStatus() {
+  async function refreshMaintenanceStatus(refreshBaseUrl = false) {
     const requestId = statusRequestId.current + 1;
     statusRequestId.current = requestId;
 
@@ -673,7 +673,7 @@ export default function HomeScreen() {
     }));
 
     try {
-      const dashboard = await getDashboard();
+      const dashboard = await getDashboard({ refreshBaseUrl });
       const successfulConnectionDate = new Date();
       const successfulConnectionAt =
         successfulConnectionDate.toLocaleDateString('fi-FI', {
@@ -800,7 +800,7 @@ export default function HomeScreen() {
       return undefined;
     }
 
-    void refreshMaintenanceStatus();
+    void refreshMaintenanceStatus(true);
 
     return () => {
       statusRequestId.current += 1;
@@ -1347,7 +1347,7 @@ export default function HomeScreen() {
             accessibilityLabel="Päivitä tila"
             disabled={serviceControlDisabled}
             onPress={() => {
-              void refreshMaintenanceStatus();
+              void refreshMaintenanceStatus(true);
             }}
             style={[
               styles.serviceControlButton,
@@ -1432,7 +1432,7 @@ export default function HomeScreen() {
               accessibilityLabel="Refresh service status"
               disabled={maintenanceStatus.loading}
               onPress={() => {
-                void refreshMaintenanceStatus();
+                void refreshMaintenanceStatus(true);
               }}
               style={[
                 styles.serviceRefreshButton,
